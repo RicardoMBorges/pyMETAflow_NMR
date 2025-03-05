@@ -24,3 +24,58 @@ This repository contains a comprehensive Python toolkit for processing, analyzin
 
 ## Installation
 
+
+
+## Usage
+
+The repository includes a Jupyter Notebook that walks through a full data processing workflow. Key steps include:
+
+- **Importing Libraries & Module:**  
+  Load essential libraries and import the custom `data_processing_NMR` module.
+
+- **Data Import:**  
+  Set your working directory and import your NMR data along with metadata.
+
+- **Preprocessing:**  
+  Filter the data by chemical shift, mask unwanted regions, and remove irrelevant samples.
+
+- **Spectral Referencing & Alignment:**  
+  Reference the spectra to a common peak and align using various methods.
+
+- **Visualization:**  
+  Generate plots to inspect raw and processed spectra.
+
+- **STOCSY Analysis:**  
+  Perform STOCSY to assess correlations across the spectrum.
+
+- **Data Transformation & Normalization:**  
+  Apply transformations, normalization, and scaling.
+
+- **Multivariate Analysis:**  
+  Conduct PCA and PLS-DA, evaluate model performance, and plot VIP scores.
+
+- **Export:**  
+  Export the processed data for use in MetaboAnalyst.
+
+---
+
+## Contributing
+
+Contributions are welcome! If you have suggestions, bug fixes, or improvements, please open an issue or submit a pull request. When contributing, please follow the repository’s coding guidelines and maintain clear documentation.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## Contact
+
+For any questions or suggestions, please contact:
+
+- **Ricardo Moreira Borges** – ricardo_mborges@ufrj.br  
+- **Stefan Hermann Kuhn** – stefan.kuhn@ut.ee
+
+
