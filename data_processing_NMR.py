@@ -1,0 +1,2306 @@
+# data_processing_NMR.py
+# by Ricardo Moreira Borges (ricardo_mborges@ufrj.br; IPPN-Universidade Federal do Rio de Janeiro)
+#    and Stefan Hermann Kuhn (stefan.kuhn@ut.ee; Universitas Tartuensis)
+#
+# =============================================================================
+# Description:
+#    This file provides functions for reading and processing NMR/metabolomics data, including:
+#      - Data extraction from MNova exports (.txt -> .csv conversion)
+#      - Combining CSV files
+#      - Filtering chemical shift/RT ranges and masking unwanted regions
+#      - Plotting NMR spectra (overlapping, multiplot, histograms with distributions)
+#      - Spectral referencing and alignment (RAFFT, PAFFT, iCOshift, alignment by regions)
+#      - Data centering, normalization & scaling methods
+#      - Multivariate analysis (PCA, PLS-DA) and variable importance (VIP) calculation
+#      - Exporting data in MetaboAnalyst format
+#      - STOCSY analysis (interactive and static)
+#
+#    NO FUNCTIONS HAVE BEEN CHANGED from the original code.
+#    Only organization & import grouping have been done.
+# =============================================================================
+
+# --------------------------------------------------------------------------
+#                           IMPORT STATEMENTS
+# --------------------------------------------------------------------------
+# Standard Library Imports
+import os
+import glob
+import re
+import csv
+import math
+
+# Data Handling Imports
+import pandas as pd
+import numpy as np
+
+# Signal Processing & Statistics Imports
+from scipy.signal import correlate, find_peaks
+from scipy.stats import norm, stats
+
+# Spectral Alignment Imports
+from pyicoshift import Icoshift
+
+# Visualization Imports
+import matplotlib.pyplot as plt
+import matplotlib.collections as mc
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+import plotly.subplots as sp
+
+# Data Analysis
+from sklearn.decomposition import PCA
+import pylab as pl
+import math
+import mpld3
+
+# --------------------------------------------------------------------------
+#               1) DATA EXTRACTION & CSV COMBINATION FUNCTIONS
+# --------------------------------------------------------------------------
+def extract_data_NMRMNova(file_path):
+    """
+    Function to import and organize NMR data from an MNova export.
+    """
+    data = pd.read_csv(file_path, delimiter="\t", on_bad_lines='skip')
+    data.rename(columns={data.columns[0]: "Chemical Shift (ppm)"}, inplace=True)
+    data = data.loc[:, ~data.columns.str.contains('^Unnamed')]
+    data.dropna(how='all', axis=1, inplace=True)
+    data.columns = [col.split("\\")[0].strip() for col in data.columns]
+    return data
+
+def combine_and_trim_data_NMRMNova(input_folder, output_folder, retention_time_start, retention_time_end):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    for file_name in os.listdir(input_folder):
+        if file_name.endswith(".txt"):
+            file_path = os.path.join(input_folder, file_name)
+            data = extract_data_NMRMNova(file_path)
+            output_file_path = os.path.join(output_folder, f"{os.path.splitext(file_name)[0]}_table.csv")
+            with open(output_file_path, 'w') as output_file:
+                for row in data:
+                    output_file.write('\t'.join(row) + '\n')
+
+    file_list = glob.glob(os.path.join(output_folder, '*_table.csv'))
+    combined_df = pd.DataFrame()
+    for file in file_list:
+        column_name = os.path.basename(file).split('_table.csv')[0]
+        df = pd.read_csv(file, delimiter='\t', header=None)
+        combined_df[column_name] = df.iloc[:, 1]
+    axis = df.iloc[:, 0]
+    combined_df2 = pd.concat([axis, combined_df], axis=1)
+    combined_df2.rename(columns={0: "RT(min)"}, inplace=True)
+    start_index = (combined_df2["RT(min)"] - retention_time_start).abs().idxmin()
+    end_index = (combined_df2["RT(min)"] - retention_time_end).abs().idxmin()
+    combined_df2 = combined_df2.loc[start_index:end_index].copy()
+    if not os.path.exists('data'):
+        os.mkdir('data')
+    combined_df2.to_csv(os.path.join(output_folder, "combined_data.csv"), sep=";", index=False)
+    return combined_df2
+
+# --------------------------------------------------------------------------
+#               2) FILTERING & MASKING FUNCTIONS
+# --------------------------------------------------------------------------
+def filter_chemical_shift(data, start_limit=0.5, end_limit=10):
+    filtered_data = data[(data["Chemical Shift (ppm)"] >= start_limit) & (data["Chemical Shift (ppm)"] <= end_limit)]
+    return filtered_data
+
+def mask_regions_with_zeros(data, regions):
+    modified_data = data.copy()
+    for start, end in regions:
+        mask = (modified_data["Chemical Shift (ppm)"] >= start) & (modified_data["Chemical Shift (ppm)"] <= end)
+        modified_data.loc[mask, modified_data.columns[1:]] = 0
+    return modified_data
+
+# --------------------------------------------------------------------------
+#               3) PLOTTING FUNCTIONS FOR NMR SPECTRA
+# --------------------------------------------------------------------------
+def create_nmr_plot(dataframe, 
+                    x_axis_col='Chemical Shift (ppm)', 
+                    start_column=1, 
+                    end_column=None, 
+                    title='NMR Spectra Overlapping',
+                    xaxis_title='Chemical Shift (ppm)',
+                    yaxis_title='Intensity',
+                    legend_title='Samples',
+                    output_dir='images', 
+                    output_file='nmr_spectra_overlapping.html',
+                    show_fig=False):
+    if end_column is None:
+        end_column = len(dataframe.columns) - 1
+    fig = go.Figure()
+    for column in dataframe.columns[start_column:end_column + 1]:
+        fig.add_trace(go.Scatter(
+            x=dataframe[x_axis_col],
+            y=dataframe[column],
+            mode='lines',
+            name=column
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title=xaxis_title,
+        yaxis_title=yaxis_title,
+        legend_title=legend_title,
+        hovermode='closest',
+        xaxis=dict(autorange='reversed')
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, output_file)
+    fig.write_html(output_path)
+    print(f"Plot saved as: {output_path}")
+    if show_fig:
+        fig.show()
+
+def create_vertical_multiplot(dataframes, titles,
+                              x_axis_col='Chemical Shift (ppm)', 
+                              start_column=1, end_column=None, 
+                              xaxis_title='Chemical Shift (ppm)', 
+                              yaxis_title='Intensity', 
+                              legend_title='Samples',
+                              output_dir='images', 
+                              output_file='aligned_nmr_multiplot.html',
+                              show_fig=True):
+    n = len(dataframes)
+    fig = sp.make_subplots(rows=n, cols=1, shared_xaxes=True,
+                           vertical_spacing=0.05,
+                           subplot_titles=titles)
+    for i, df in enumerate(dataframes, start=1):
+        x = df[x_axis_col].values
+        if end_column is None:
+            intensity_cols = df.columns[start_column:]
+        else:
+            intensity_cols = df.columns[start_column:end_column+1]
+        for col in intensity_cols:
+            fig.add_trace(
+                go.Scattergl(x=x, y=df[col].values, mode='lines', name=col),
+                row=i, col=1
+            )
+        fig.update_yaxes(title_text=yaxis_title, row=i, col=1)
+    fig.update_layout(
+        title="Comparison of Aligned NMR Spectra",
+        xaxis_title=xaxis_title,
+        legend_title=legend_title,
+        height=500 * n,
+        margin=dict(t=100)
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    fig.write_html(os.path.join(output_dir, output_file))
+    if show_fig:
+        fig.show()
+    return fig
+
+def plot_histogram_with_distribution(data, output_dir='images', file_name='histogram_with_distribution_curve.html', log_scale=False, x_range=None):
+    melted_df = data.melt(value_name="Normalized Value")
+    os.makedirs(output_dir, exist_ok=True)
+    mean_val = melted_df["Normalized Value"].mean()
+    std_val = melted_df["Normalized Value"].std()
+    x_values = np.linspace(melted_df["Normalized Value"].min(), melted_df["Normalized Value"].max(), 100)
+    normal_curve = norm.pdf(x_values, mean_val, std_val)
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=melted_df["Normalized Value"], 
+        histnorm='probability density', 
+        opacity=0.6,
+        name='Normalized Data'
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_values,
+        y=normal_curve,
+        mode='lines',
+        line=dict(color='blue', width=2),
+        name='Normal Distribution Curve'
+    ))
+    fig.update_layout(
+        title='Histogram with Normal Distribution Curve',
+        xaxis_title='Normalized Value',
+        yaxis_title='Density',
+        showlegend=True
+    )
+    if log_scale:
+        fig.update_xaxes(type="log")
+    if x_range:
+        fig.update_xaxes(range=x_range)
+    fig.write_html(os.path.join(output_dir, file_name))
+    return fig
+
+# --------------------------------------------------------------------------
+#               4) SPECTRAL REFERENCING & ALIGNMENT FUNCTIONS
+# --------------------------------------------------------------------------
+def ref_spectra_to_df(df, thresh=0.01, offsetppm=None, interactive=True, testThreshold=False, xlim=(-0.7, 0.7)):
+    axis_col = "Chemical Shift (ppm)"
+    if df.columns[0] != axis_col:
+        raise ValueError(f"The first column must be named '{axis_col}'")
+    ppm_orig = df[axis_col].values
+    sample_cols = list(df.columns[1:])
+    offsets = {}
+    sample1 = sample_cols[0]
+    intensity1 = df[sample1].values
+    thresh_val = thresh * np.max(intensity1)
+    peaks, _ = find_peaks(intensity1, height=thresh_val)
+    candidate_mask = (ppm_orig[peaks] >= xlim[0]) & (ppm_orig[peaks] <= xlim[1])
+    candidate_peaks = peaks[candidate_mask]
+    if len(candidate_peaks) == 0:
+        print(f"No candidate peaks found in {sample1} within {xlim}. No referencing applied for this spectrum.")
+        offset1 = 0.0
+    else:
+        if testThreshold:
+            plt.figure()
+            plt.plot(ppm_orig, intensity1, 'k-', label=sample1)
+            plt.plot(ppm_orig[candidate_peaks], intensity1[candidate_peaks], 'ro', label='Candidates')
+            plt.xlim(xlim)
+            plt.gca().invert_xaxis()
+            plt.title(f"Candidate Peaks for {sample1} (Threshold Test)")
+            plt.xlabel("Chemical Shift (ppm)")
+            plt.ylabel("Intensity")
+            plt.legend()
+            plt.show()
+            return None, None
+        if offsetppm is not None:
+            diff = np.abs(ppm_orig[candidate_peaks] - offsetppm)
+            idx = np.argmin(diff)
+            offset1 = ppm_orig[candidate_peaks][idx]
+        else:
+            if interactive:
+                plt.figure()
+                plt.plot(ppm_orig, intensity1, 'k-')
+                plt.plot(ppm_orig[candidate_peaks], intensity1[candidate_peaks], 'ro')
+                plt.xlim(xlim)
+                plt.gca().invert_xaxis()
+                plt.title(f"Click near the reference peak for {sample1}")
+                plt.xlabel("Chemical Shift (ppm)")
+                plt.ylabel("Intensity")
+                pts = plt.ginput(1, timeout=-1)
+                plt.close()
+                if pts:
+                    click_x = pts[0][0]
+                    diff = np.abs(ppm_orig[candidate_peaks] - click_x)
+                    idx = np.argmin(diff)
+                    offset1 = ppm_orig[candidate_peaks][idx]
+                else:
+                    print("No selection made; defaulting to no shift.")
+                    offset1 = 0.0
+            else:
+                heights = intensity1[candidate_peaks]
+                idx = np.argmax(heights)
+                offset1 = ppm_orig[candidate_peaks][idx]
+    offsets[sample1] = offset1
+    new_axis = ppm_orig - offset1
+    ref_intensity = {}
+    for sample in sample_cols:
+        intensity = df[sample].values
+        thresh_val = thresh * np.max(intensity)
+        peaks, _ = find_peaks(intensity, height=thresh_val)
+        if len(peaks) == 0:
+            print(f"No peaks found in {sample}; no referencing applied.")
+            offset_i = 0.0
+        else:
+            candidate_ppms = ppm_orig[peaks]
+            idx = np.argmin(np.abs(candidate_ppms))
+            offset_i = candidate_ppms[idx]
+        offsets[sample] = offset_i
+        shifted_axis = ppm_orig - offset_i
+        intensity_interp = np.interp(new_axis, shifted_axis, intensity)
+        ref_intensity[sample] = intensity_interp
+        print(f"Sample '{sample}' referenced using offset {offset_i:.4f} ppm.")
+    referenced_df = pd.DataFrame({axis_col: new_axis})
+    for sample in sample_cols:
+        referenced_df[sample] = ref_intensity[sample]
+    return referenced_df, offsets
+
+def align_samples_using_icoshift(df, n_intervals=50, target='maxcorr'):
+    ppm = df.iloc[:, 0].to_numpy()
+    Xnp = df.iloc[:, 1:].to_numpy()
+    if np.isnan(Xnp).all():
+        raise ValueError("Spectral data contains only NaNs!")
+    if ppm.shape[0] != Xnp.shape[0]:
+        raise ValueError(f"Mismatch: ppm has {ppm.shape[0]} values, but Xnp has {Xnp.shape[0]} rows.")
+    Xnp = Xnp.T
+    Xnp = np.nan_to_num(Xnp)
+    fix_int_size = Icoshift()
+    fix_int_size.signals = Xnp
+    fix_int_size.unit_vector = ppm
+    fix_int_size.inter = ('n_intervals', n_intervals)
+    fix_int_size.target = target
+    fix_int_size.run()
+    aligned_df = pd.DataFrame(fix_int_size.result.T, columns=df.columns[1:])
+    aligned_df.insert(0, df.columns[0], ppm)
+    return aligned_df
+
+def RAFFT_df(data, reference_idx=0, shift_ppm=None, lookahead=1):
+    axis = data.iloc[:, 0].values
+    intensities = data.iloc[:, 1:].values
+    n_points = len(axis)
+    if intensities.shape[0] == n_points:
+        intensities = intensities.T
+    n_spectra = intensities.shape[0]
+    if reference_idx < 0 or reference_idx >= n_spectra:
+        raise ValueError(f"Reference index must be between 0 and {n_spectra-1}.")
+    reference_spectrum = intensities[reference_idx, :]
+    if shift_ppm is not None:
+        dppm = np.abs(axis[1] - axis[0])
+        shift = int(round(shift_ppm / dppm))
+    else:
+        shift = len(reference_spectrum)
+    aligned_intensities = np.zeros_like(intensities)
+    for i in range(n_spectra):
+        aligned_intensities[i, :] = recur_align(intensities[i, :], reference_spectrum, shift, lookahead)
+    aligned_intensities = aligned_intensities.T
+    aligned_df = pd.DataFrame(np.column_stack((axis, aligned_intensities)), columns=data.columns)
+    return aligned_df
+
+# -------------------------- Helper Functions for RAFFT --------------------------
+def recur_align(spectrum, reference, shift, lookahead):
+    if len(spectrum) < 10:
+        return spectrum
+    lag = fft_corr(spectrum, reference, shift)
+    if lag == 0 and lookahead <= 0:
+        return spectrum
+    else:
+        if lag == 0:
+            lookahead -= 1
+        if abs(lag) < len(spectrum):
+            aligned = move_seg(spectrum, lag)
+        else:
+            aligned = spectrum.copy()
+        mid = find_mid(aligned)
+        first_seg = recur_align(aligned[:mid], reference[:mid], shift, lookahead)
+        second_seg = recur_align(aligned[mid:], reference[mid:], shift, lookahead)
+        return np.concatenate([first_seg, second_seg])
+
+def fft_corr(spectrum, target, shift):
+    M = len(target)
+    diff = 1e6
+    for i in range(1, 21):
+        curdiff = (2**i) - M
+        if curdiff > 0 and curdiff < diff:
+            diff = curdiff
+    diff = int(diff)
+    target_pad = np.pad(target, (0, diff), mode='constant')
+    spectrum_pad = np.pad(spectrum, (0, diff), mode='constant')
+    M_new = len(target_pad)
+    X = np.fft.fft(target_pad)
+    Y = np.fft.fft(spectrum_pad)
+    R = (X * np.conjugate(Y)) / M_new
+    rev = np.fft.ifft(R)
+    vals = np.real(rev)
+    maxi = -1
+    maxpos = 0
+    shift = min(shift, M_new)
+    for i in range(shift):
+        if vals[i] > maxi:
+            maxi = vals[i]
+            maxpos = i
+        if vals[M_new - i - 1] > maxi:
+            maxi = vals[M_new - i - 1]
+            maxpos = M_new - i - 1
+    if maxi < 0.1:
+        return 0
+    if maxpos > len(vals) / 2:
+        lag = maxpos - len(vals) - 1
+    else:
+        lag = maxpos - 1
+    return lag
+
+def move_seg(seg, lag):
+    if lag == 0 or lag >= len(seg):
+        return seg
+    if lag > 0:
+        ins = np.full(lag, seg[0])
+        return np.concatenate([ins, seg[:-lag]])
+    else:
+        lag_abs = abs(lag)
+        ins = np.full(lag_abs, seg[-1])
+        return np.concatenate([seg[lag_abs:], ins])
+
+def find_mid(spec):
+    M = int(np.ceil(len(spec) / 2))
+    offset = int(np.floor(M / 4))
+    start = max(M - offset, 0)
+    end = min(M + offset, len(spec))
+    spec_segment = spec[start:end]
+    I = np.argmin(spec_segment)
+    mid = I + start
+    return mid
+
+def PAFFT_df(data, segSize_ppm, reference_idx=0, shift_ppm=None):
+    axis = data.iloc[:, 0].values
+    intensities = data.iloc[:, 1:].values
+    n_points = len(axis)
+    if intensities.shape[0] == n_points:
+        intensities = intensities.T
+    n_spectra = intensities.shape[0]
+    if reference_idx < 0 or reference_idx >= n_spectra:
+        raise ValueError(f"Reference index must be between 0 and {n_spectra-1}.")
+    reference_spectrum = intensities[reference_idx, :]
+    dppm = np.abs(axis[1] - axis[0])
+    if shift_ppm is not None:
+        shift = int(round(shift_ppm / dppm))
+    else:
+        shift = len(reference_spectrum)
+    segSize = int(round(segSize_ppm / dppm))
+    aligned_intensities = np.zeros_like(intensities)
+    for i in range(n_spectra):
+        aligned_intensities[i, :] = PAFFT(intensities[i, :], reference_spectrum, segSize, shift)
+    aligned_intensities = aligned_intensities.T
+    aligned_df = pd.DataFrame(np.column_stack((axis, aligned_intensities)), columns=data.columns)
+    return aligned_df
+
+def PAFFT(spectrum, reference, segSize, shift):
+    n_points = len(spectrum)
+    aligned_segments = []
+    startpos = 0
+    while startpos < n_points:
+        endpos = startpos + segSize * 2
+        if endpos >= n_points:
+            samseg = spectrum[startpos:]
+            refseg = reference[startpos:]
+        else:
+            samseg = spectrum[startpos + segSize: endpos - 1]
+            refseg = reference[startpos + segSize: endpos - 1]
+            minpos = find_min(samseg, refseg)
+            endpos = startpos + minpos + segSize
+            samseg = spectrum[startpos:endpos]
+            refseg = reference[startpos:endpos]
+        lag = fft_corr(samseg, refseg, shift)
+        moved = move_seg(samseg, lag)
+        aligned_segments.append(moved)
+        startpos = endpos + 1
+    aligned_full = np.concatenate(aligned_segments)
+    if len(aligned_full) < n_points:
+        aligned_full = np.pad(aligned_full, (0, n_points - len(aligned_full)), mode='edge')
+    else:
+        aligned_full = aligned_full[:n_points]
+    return aligned_full
+
+def find_min(samseg, refseg):
+    Cs = np.sort(samseg)
+    Is = np.argsort(samseg)
+    Cr = np.sort(refseg)
+    Ir = np.argsort(refseg)
+    n_limit = max(1, int(round(len(Cs) / 20)))
+    for i in range(n_limit):
+        for j in range(n_limit):
+            if Ir[j] == Is[i]:
+                return Is[i]
+    return Is[0]
+
+def apply_alignment_by_regions(aligned_df, region_alignments):
+    aligned_parts = []
+    for region_info in region_alignments:
+        start_ppm, end_ppm = region_info['region']
+        align_func = region_info['align_func']
+        params = region_info.get('params', {})
+        region_mask = (aligned_df["Chemical Shift (ppm)"] >= start_ppm) & (aligned_df["Chemical Shift (ppm)"] <= end_ppm)
+        region_df = aligned_df.loc[region_mask].copy()
+        aligned_region = align_func(region_df, **params)
+        aligned_parts.append(aligned_region)
+    final_aligned_df = pd.concat(aligned_parts, ignore_index=True)
+    final_aligned_df = final_aligned_df.sort_values("Chemical Shift (ppm)").reset_index(drop=True)
+    return final_aligned_df
+
+# --------------------------------------------------------------------------
+#               5) EXPORT FUNCTIONS
+# --------------------------------------------------------------------------
+def sanitize_string(s):
+    return re.sub(r'[^a-zA-Z0-9_]', '', s)
+
+def export_metaboanalyst(aligned_df, df_metadata,
+                         sample_id_col="NMR_filename",
+                         class_col="ATTRIBUTE_classification",
+                         output_file="metaboanalyst_input.csv"):
+    orig_col_names = list(aligned_df.columns)
+    sanitized_sample_cols = [sanitize_string(s) for s in orig_col_names[1:]]
+    sanitized_col_names = [orig_col_names[0]] + sanitized_sample_cols
+    aligned_df = aligned_df.copy()
+    aligned_df.columns = sanitized_col_names
+    sample_cols = sanitized_col_names[1:]
+    meta = df_metadata.copy()
+    meta[sample_id_col] = meta[sample_id_col].apply(sanitize_string)
+    meta[class_col] = meta[class_col].apply(sanitize_string)
+    meta_indexed = meta.set_index(sample_id_col)
+    classification_series = meta_indexed.reindex(sample_cols)[class_col]
+    valid_sample_cols = classification_series.dropna().index.tolist()
+    if len(valid_sample_cols) < len(sample_cols):
+        missing = set(sample_cols) - set(valid_sample_cols)
+        print(f"Warning: The following sample IDs are missing metadata and will be excluded: {missing}")
+    classification_row = [""]
+    classification_row.extend(classification_series.loc[valid_sample_cols].values)
+    new_df = aligned_df[['Chemical Shift (ppm)'] + valid_sample_cols].copy()
+    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+    with open(output_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(new_df.columns.tolist())
+        writer.writerow(classification_row)
+        for i in range(len(new_df)):
+            writer.writerow(new_df.iloc[i].values)
+    print(f"MetaboAnalyst input CSV saved as: {output_file}")
+    return new_df
+
+# --------------------------------------------------------------------------
+#               6) CENTERING, NORMALIZATION & SCALING FUNCTIONS
+# --------------------------------------------------------------------------
+# Centering Functions
+def log_transform(df, constant=1):
+    df = df.copy()
+    for column in df.columns:
+        if column != "Chemical Shift (ppm)":
+            adjusted = df[column] + constant
+            adjusted = adjusted.where(adjusted > 0, np.finfo(float).eps)
+            df[column] = np.log10(adjusted)
+    return df
+
+def sqrt_transform(df):
+    df = df.copy()
+    for column in df.columns:
+        if column != "Chemical Shift (ppm)":
+            df[column] = np.sqrt(df[column].clip(lower=0))
+    return df
+
+def cbrt_transform(df):
+    df = df.copy()
+    for column in df.columns:
+        if column != "Chemical Shift (ppm)":
+            df[column] = np.cbrt(df[column])
+    return df
+
+# Normalization Functions
+def min_max_normalize(df):
+    df = df.copy()
+    for column in df.columns:
+        if column != "Chemical Shift (ppm)":
+            min_val = df[column].min()
+            max_val = df[column].max()
+            df[column] = (df[column] - min_val) / (max_val - min_val)
+    return df
+
+def z_score_normalize(df, exclude_columns=None):
+    df = df.copy()
+    exclude_columns = exclude_columns if exclude_columns else []
+    for column in df.columns:
+        if column not in exclude_columns and column != 'Chemical Shift (ppm)':
+            mean_val = df[column].mean()
+            std_val = df[column].std()
+            if std_val != 0:
+                df[column] = (df[column] - mean_val) / std_val
+            else:
+                df[column] = df[column] - mean_val
+    return df
+
+def normalize_by_control(df, control_column, exclude_columns=None):
+    df = df.copy()
+    exclude_columns = exclude_columns if exclude_columns else []
+    control = df[control_column]
+    for column in df.columns:
+        if column != control_column and column not in exclude_columns and column != 'RT(min)':
+            df[column] = df[column] / control
+    return df
+
+def pqn_normalize(df, reference=None, exclude_columns=None):
+    df = df.copy()
+    exclude_columns = exclude_columns if exclude_columns else []
+    cols = [col for col in df.columns if col != 'Chemical Shift (ppm)' and col not in exclude_columns]
+    df_numeric = df[cols]
+    if reference is None:
+        reference = df_numeric.median(axis=1)
+    quotients = df_numeric.divide(reference, axis=0)
+    median_quotients = quotients.median(axis=0)
+    df_norm = df_numeric.divide(median_quotients, axis=1)
+    for col in df.columns:
+        if col not in df_norm.columns:
+            df_norm[col] = df[col]
+    df_norm = df_norm[df.columns]
+    return df_norm
+
+def std_dev_normalize(df, exclude_columns=None):
+    df = df.copy()
+    exclude_columns = exclude_columns if exclude_columns else []
+    for column in df.columns:
+        if column not in exclude_columns and column != 'Chemical Shift (ppm)':
+            std_val = df[column].std()
+            if std_val != 0:
+                df[column] = df[column] / std_val
+    return df
+
+def median_normalize(df, target_median=1.0, exclude_columns=None):
+    df = df.copy()
+    exclude_columns = exclude_columns if exclude_columns else []
+    for column in df.columns:
+        if column not in exclude_columns and column != 'Chemical Shift (ppm)':
+            median_val = df[column].median()
+            if median_val != 0:
+                df[column] = (df[column] / median_val) * target_median
+    return df
+
+def quantile_normalize(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    else:
+        exclude_columns = list(set(exclude_columns + ["RT(min)", "Chemical Shift (ppm)"]))
+    norm_cols = [col for col in df.columns if col not in exclude_columns]
+    df_numeric = df[norm_cols]
+    sorted_df = pd.DataFrame(
+        np.sort(df_numeric.values, axis=0),
+        index=df_numeric.index,
+        columns=df_numeric.columns
+    )
+    rank_means = sorted_df.mean(axis=1)
+    df_normalized = df_numeric.copy()
+    for col in df_numeric.columns:
+        order = df_numeric[col].argsort()
+        normalized_vals = pd.Series(rank_means.values, index=order)
+        df_normalized[col] = normalized_vals.sort_index().values
+    for col in exclude_columns:
+        df_normalized[col] = df[col]
+    df_normalized = df_normalized[df.columns]
+    return df_normalized
+
+# Scaling Functions
+def min_max_scale(df, new_min=0, new_max=1, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            min_val = df[column].min()
+            max_val = df[column].max()
+            if max_val != min_val:
+                df[column] = (df[column] - min_val) / (max_val - min_val) * (new_max - new_min) + new_min
+    return df
+
+def standard_scale(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            mean_val = df[column].mean()
+            std_val = df[column].std()
+            if std_val != 0:
+                df[column] = (df[column] - mean_val) / std_val
+            else:
+                df[column] = df[column] - mean_val
+    return df
+
+def robust_scale(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            median_val = df[column].median()
+            Q1 = df[column].quantile(0.25)
+            Q3 = df[column].quantile(0.75)
+            IQR = Q3 - Q1
+            if IQR != 0:
+                df[column] = (df[column] - median_val) / IQR
+    return df
+
+def mean_center(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            df[column] = df[column] - df[column].mean()
+    return df
+
+def auto_scale(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            std_val = df[column].std()
+            if std_val != 0:
+                df[column] = (df[column] - df[column].mean()) / std_val
+            else:
+                df[column] = df[column] - df[column].mean()
+    return df
+
+def pareto_scale(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            std_val = df[column].std()
+            if std_val != 0:
+                df[column] = (df[column] - df[column].mean()) / np.sqrt(std_val)
+            else:
+                df[column] = df[column] - df[column].mean()
+    return df
+
+def range_scale(df, exclude_columns=None):
+    df = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+    for column in df.columns:
+        if column not in exclude_columns:
+            rng = df[column].max() - df[column].min()
+            if rng != 0:
+                df[column] = (df[column] - df[column].mean()) / rng
+    return df
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import pandas as pd
+
+def compare_normalization_plots(before_df, after_df, 
+                                sample_limit=50, 
+                                exclude_columns=None, 
+                                title_before='Before Normalization',
+                                title_after='After Normalization'):
+    """
+    Creates a 2x2 grid of plots:
+      - Top-left: Density plot of all values before normalization
+      - Top-right: Density plot of all values after normalization
+      - Bottom-left: Box plot (at most sample_limit columns) before normalization
+      - Bottom-right: Box plot (at most sample_limit columns) after normalization
+
+    Parameters:
+    -----------
+    before_df : pd.DataFrame
+        DataFrame containing the data prior to normalization.
+    after_df : pd.DataFrame
+        DataFrame containing the data after normalization.
+    sample_limit : int
+        Maximum number of columns to display in the box plots.
+    exclude_columns : list or None
+        List of columns to exclude from both DataFrames (e.g. axis columns like "Chemical Shift (ppm)").
+    title_before : str
+        Title for the "before" plots.
+    title_after : str
+        Title for the "after" plots.
+    """
+    # Copy DataFrames so we don't modify the originals
+    df_before = before_df.copy()
+    df_after = after_df.copy()
+    
+    # Exclude certain columns if requested (e.g. "Chemical Shift (ppm)", "RT(min)", etc.)
+    if exclude_columns is not None:
+        df_before.drop(columns=exclude_columns, errors='ignore', inplace=True)
+        df_after.drop(columns=exclude_columns, errors='ignore', inplace=True)
+    
+    # Flatten the entire DataFrame values for density plots
+    all_values_before = df_before.values.flatten()
+    all_values_after = df_after.values.flatten()
+
+    # Limit columns for box plot (for readability)
+    limited_cols_before = df_before.columns[:sample_limit]
+    limited_cols_after = df_after.columns[:sample_limit]
+    
+    # Create a 2x2 figure
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    plt.subplots_adjust(wspace=0.3, hspace=0.4)
+    
+    # --- Top-left: Density of all values BEFORE normalization ---
+    sns.kdeplot(x=all_values_before, ax=axes[0,0], color='steelblue', fill=True)
+    axes[0,0].set_title(title_before, fontsize=12)
+    axes[0,0].set_xlabel("Value")
+    axes[0,0].set_ylabel("Density")
+
+    # --- Top-right: Density of all values AFTER normalization ---
+    sns.kdeplot(x=all_values_after, ax=axes[0,1], color='darkorange', fill=True)
+    axes[0,1].set_title(title_after, fontsize=12)
+    axes[0,1].set_xlabel("Value")
+    axes[0,1].set_ylabel("Density")
+
+    # --- Bottom-left: Box plot BEFORE normalization ---
+    sns.boxplot(data=df_before[limited_cols_before], ax=axes[1,0], color='steelblue')
+    axes[1,0].tick_params(axis='x', rotation=90)
+    axes[1,0].set_title(title_before, fontsize=12)
+    axes[1,0].set_ylabel("Value")
+
+    # --- Bottom-right: Box plot AFTER normalization ---
+    sns.boxplot(data=df_after[limited_cols_after], ax=axes[1,1], color='darkorange')
+    axes[1,1].tick_params(axis='x', rotation=90)
+    axes[1,1].set_title(title_after, fontsize=12)
+    axes[1,1].set_ylabel("Value")
+    
+    # Show the final figure
+    plt.show()
+
+
+# --------------------------------------------------------------------------
+#               7) PCA & PLS-DA, VIP FUNCTIONS
+# --------------------------------------------------------------------------
+def perform_pca_analysis(data, pc_x=1, pc_y=2, n_components=None, variance_threshold=90,
+                         metadata=None, color_column="ATTRIBUTE_group", sample_id_col="ATTRIBUTE_localsampleid",
+                         output_dir='images', score_plot_filename=None, ev_plot_filename=None,
+                         show_fig=True):
+    if (score_plot_filename is not None) or (ev_plot_filename is not None):
+        os.makedirs(output_dir, exist_ok=True)
+    X = data.transpose()
+    max_comp = min(X.shape)
+    pca_full = PCA(n_components=max_comp)
+    pca_full.fit(X)
+    cum_var = np.cumsum(pca_full.explained_variance_ratio_) * 100
+    n_comp = np.argmax(cum_var >= variance_threshold) + 1
+    n_comp = max(n_comp, pc_x, pc_y)
+    if n_components is not None:
+        n_comp = n_components
+    pca_model = PCA(n_components=n_comp)
+    principal_components = pca_model.fit_transform(X)
+    comp_labels = [f"PC{i+1}" for i in range(n_comp)]
+    scores_df = pd.DataFrame(principal_components, columns=comp_labels, index=X.index)
+    if metadata is not None:
+        scores_df = scores_df.merge(metadata[[sample_id_col, color_column]],
+                                    left_index=True, right_on=sample_id_col, how='left')
+    fig_scores = px.scatter(
+        scores_df, 
+        x=f"PC{pc_x}", 
+        y=f"PC{pc_y}",
+        color=color_column if metadata is not None else None,
+        title="PCA Score Plot",
+        labels={f"PC{pc_x}": f"Principal Component {pc_x}", 
+                f"PC{pc_y}": f"Principal Component {pc_y}"}
+    )
+    if score_plot_filename is not None:
+        score_plot_file = os.path.join(output_dir, score_plot_filename)
+        fig_scores.write_html(score_plot_file)
+    if show_fig:
+        fig_scores.show()
+    explained_variance = pca_model.explained_variance_ratio_ * 100
+    ev_df = pd.DataFrame({
+        "Component": comp_labels, 
+        "Explained Variance (%)": explained_variance
+    })
+    fig_ev = px.bar(
+        ev_df, 
+        x="Component", 
+        y="Explained Variance (%)",
+        title="Explained Variance by Principal Components",
+        text=ev_df["Explained Variance (%)"].apply(lambda x: f"{x:.1f}%")
+    )
+    fig_ev.update_traces(textposition='outside')
+    if ev_plot_filename is not None:
+        ev_plot_file = os.path.join(output_dir, ev_plot_filename)
+        fig_ev.write_html(ev_plot_file)
+    if show_fig:
+        fig_ev.show()
+    return pca_model, scores_df, explained_variance
+
+def plot_pca_loadings(data, pca_model, PC_choose=1, x_axis_col='Chemical Shift (ppm)', 
+                      output_dir='images', output_file=None, save_fig=True, show_fig=True):
+    if output_file is None:
+        output_file = f'PCA_PC{PC_choose}_Loadings.html'
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data[x_axis_col],
+        y=pca_model.components_[PC_choose - 1],
+        mode='lines',
+        name=f'PC{PC_choose} Loading'
+    ))
+    fig.update_layout(
+        title=f'PC{PC_choose} Loading Plot',
+        xaxis_title=x_axis_col,
+        yaxis_title='Loading Value',
+        legend_title='Component',
+        xaxis=dict(autorange='reversed')
+    )
+    if save_fig:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file)
+        fig.write_html(output_path)
+        print(f"Plot saved as: {output_path}")
+    if show_fig:
+        fig.show()
+    return fig
+
+def plot_pca_scores(scores_df, pc_x, pc_y, explained_variance):
+    fig = px.scatter(scores_df, x=f'PC{pc_x}', y=f'PC{pc_y}', text=scores_df.index, title=f'PCA Score Plot: PC{pc_x} vs PC{pc_y}')
+    fig.update_layout(
+        xaxis_title=f'PC{pc_x} ({explained_variance[pc_x-1]:.2f}%)',
+        yaxis_title=f'PC{pc_y} ({explained_variance[pc_y-1]:.2f}%)'
+    )
+    fig.update_traces(marker=dict(size=7),
+                      selector=dict(mode='markers+text'))
+    fig.show()
+
+    
+import os
+import numpy as np
+import pandas as pd
+import plotly.express as px
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.preprocessing import OneHotEncoder
+
+def perform_pls_da(
+    data,
+    metadata,
+    group_col="ATTRIBUTE_group",
+    sample_id_col="ATTRIBUTE_localsampleid",
+    n_components=2,
+    output_dir="images",
+    score_plot_filename=None,
+    show_fig=True
+):
+    """
+    Perform PLS-DA (Partial Least Squares Discriminant Analysis) by:
+      1. One-hot encoding the class labels.
+      2. Fitting a PLSRegression model.
+      3. Plotting the first two latent variable scores, colored by group.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Normalized feature matrix with columns as samples (and rows as features).
+        (Does NOT include the chemical shift axis.)
+    metadata : pd.DataFrame
+        DataFrame containing sample metadata. Must include the sample_id_col (matching data columns)
+        and a grouping column (group_col) for classification.
+    group_col : str
+        Column in metadata that contains the class/group labels (e.g., "ATTRIBUTE_group").
+    sample_id_col : str
+        Column in metadata that matches the sample IDs in data’s columns (e.g., "ATTRIBUTE_localsampleid").
+    n_components : int
+        Number of latent variables (components) to use in the PLS model. Default=2 for a 2D plot.
+    output_dir : str
+        Directory where the HTML plot will be saved if score_plot_filename is not None.
+    score_plot_filename : str or None
+        If provided, the interactive plot is saved as an HTML file with this name in output_dir.
+    show_fig : bool
+        If True, the interactive Plotly figure is displayed.
+
+    Returns
+    -------
+    pls_model : PLSRegression
+        The fitted PLS regression model.
+    scores_df : pd.DataFrame
+        DataFrame containing the latent variable scores for each sample, merged with group labels.
+    """
+
+    # Ensure output directory exists if we plan to save
+    if score_plot_filename is not None:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # 1. Transpose data so rows = samples, columns = features
+    X = data.transpose()  # shape = [n_samples, n_features]
+
+    # 2. Align the metadata so that it matches the rows of X
+    sample_index_df = pd.DataFrame({sample_id_col: X.index})
+    merged_df = sample_index_df.merge(metadata, on=sample_id_col, how='left')
+
+    # 3. One-hot encode the group labels for PLS-DA
+    groups = merged_df[group_col].astype(str).values.reshape(-1, 1)
+    encoder = OneHotEncoder(sparse_output=False)
+    Y = encoder.fit_transform(groups)  # shape = [n_samples, n_classes]
+
+    # 4. Fit the PLS regression model
+    pls_model = PLSRegression(n_components=n_components)
+    pls_model.fit(X, Y)
+
+    # 5. Extract x-scores (latent variable scores for each sample)
+    x_scores = pls_model.x_scores_
+    lv_cols = [f"LV{i+1}" for i in range(n_components)]
+    scores_df = pd.DataFrame(x_scores, columns=lv_cols, index=X.index)
+
+    # (A) Reset index and rename so sample IDs become a column named sample_id_col
+    scores_df = scores_df.reset_index().rename(columns={"index": sample_id_col})
+
+    # (B) Merge on the sample_id_col
+    scores_df = scores_df.merge(
+        merged_df[[sample_id_col, group_col]],
+        on=sample_id_col,
+        how='left'
+    )
+
+    # 6. Plot the first two latent variables in an interactive scatter plot
+    if n_components >= 2:
+        fig = px.scatter(
+            scores_df,
+            x="LV1",
+            y="LV2",
+            color=group_col,
+            hover_data=[sample_id_col],
+            title="PLS-DA Score Plot (LV1 vs. LV2)",
+            labels={"LV1": "Latent Variable 1", "LV2": "Latent Variable 2"}
+        )
+        if score_plot_filename is not None:
+            html_path = os.path.join(output_dir, score_plot_filename)
+            fig.write_html(html_path)
+        if show_fig:
+            fig.show()
+    else:
+        print(f"n_components={n_components} < 2, so no 2D score plot was generated.")
+
+    return pls_model, scores_df
+
+
+    
+    
+def plot_plsda_loadings(data, plsr_model, component=1, x_axis_col='RT(min)', 
+                        output_dir='images', output_file=None, save_fig=True, show_fig=True):
+    loadings = plsr_model.x_loadings_
+    if component < 1 or component > loadings.shape[1]:
+        raise ValueError(f"Component number must be between 1 and {loadings.shape[1]}, got {component}")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data[x_axis_col],
+        y=loadings[:, component - 1],
+        mode='lines',
+        name=f'PLS-DA Component {component} Loading'
+    ))
+    fig.update_layout(
+        title=f'PLS-DA Component {component} Loading Plot',
+        xaxis_title=x_axis_col,
+        yaxis_title='Loading Value'
+    )
+    if save_fig:
+        if output_file is None:
+            output_file = f'PLSDA_Component_{component}_Loadings.html'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file)
+        fig.write_html(output_path)
+        print(f"Plot saved as: {output_path}")
+    if show_fig:
+        fig.show()
+    return fig
+
+def calculate_vip_scores(pls_model, X):
+    t = pls_model.x_scores_
+    w = pls_model.x_weights_
+    q = pls_model.y_loadings_
+    p, h = w.shape
+    vip = np.zeros((p,))
+    s = np.diag(t.T @ t @ q.T @ q).reshape(h, -1)
+    total_s = np.sum(s)
+    for i in range(p):
+        weight = np.array([(w[i, j] / np.linalg.norm(w[:, j]))**2 for j in range(h)])
+        vip[i] = np.sqrt(p * (s.T @ weight) / total_s)
+    return vip
+
+def analyze_vip_scores(pls_model, X, top_n=10,
+                       save_df=False, output_dir='images', output_file_df=None,
+                       plot_fig=False, save_fig=False, output_file_plot=None, show_fig=True):
+    vip = calculate_vip_scores(pls_model, X)
+    vip_df = pd.DataFrame({'Variable': X.columns, 'VIP Score': vip})
+    vip_df = vip_df.sort_values(by='VIP Score', ascending=False)
+    top_vip = vip_df.head(top_n)
+    if save_df:
+        if output_file_df is None:
+            output_file_df = 'VIP_scores.csv'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file_df)
+        top_vip.to_csv(output_path, index=False)
+        print(f"VIP scores saved as: {output_path}")
+    if plot_fig:
+        fig = px.bar(top_vip, x='Variable', y='VIP Score',
+                     title='Top VIP Scores',
+                     text='VIP Score')
+        fig.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+        fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+        if save_fig:
+            if output_file_plot is None:
+                output_file_plot = 'VIP_scores_plot.html'
+            os.makedirs(output_dir, exist_ok=True)
+            plot_path = os.path.join(output_dir, output_file_plot)
+            fig.write_html(plot_path)
+            print(f"VIP scores plot saved as: {plot_path}")
+        if show_fig:
+            fig.show()
+    return top_vip
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def calculate_vip(pls_model):
+    """
+    Calculate VIP (Variable Importance in Projection) scores for a fitted PLS model.
+    Assumes a single response variable.
+    
+    Parameters
+    ----------
+    pls_model : fitted PLSRegression model (from sklearn.cross_decomposition)
+    
+    Returns
+    -------
+    vip : np.array of shape (n_predictors,)
+        VIP scores for each predictor.
+    """
+    t = pls_model.x_scores_  # latent scores, shape (n_samples, n_components)
+    w = pls_model.x_weights_ # weights, shape (n_predictors, n_components)
+    q = pls_model.y_loadings_  # y loadings, shape (n_components, 1) for single response
+    A = w.shape[1]
+    p = w.shape[0]
+    
+    # Calculate the explained sum of squares for each component.
+    ssy = np.zeros(A)
+    for a in range(A):
+        ssy[a] = np.sum(t[:, a]**2) * (q[a, 0] ** 2)
+    total_ssy = np.sum(ssy)
+    
+    vip = np.zeros(p)
+    for j in range(p):
+        sum_term = 0.0
+        for a in range(A):
+            norm_w_a = np.linalg.norm(w[:, a])
+            sum_term += ((w[j, a] / norm_w_a) ** 2) * ssy[a]
+        vip[j] = np.sqrt(p * sum_term / total_ssy)
+    return vip
+
+def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0, 
+                      output_filename=None, show_fig=True, figure_size=(10, 6)):
+    """
+    Plot the loadings for a chosen component from a fitted PLS-DA model against the chemical shift axis.
+    
+    The loadings are plotted as a continuous trace (line) and overlaid with markers that are color-coded 
+    based on their VIP scores:
+      - Markers in red for VIP >= vip_threshold and positive loading.
+      - Markers in blue for VIP >= vip_threshold and negative loading.
+      - Markers in gray for VIP < vip_threshold.
+    
+    Parameters
+    ----------
+    pls_model : fitted PLSRegression model
+        The PLS-DA model from which to extract loadings.
+    chemical_shift : array-like, shape (n_predictors,)
+        The chemical shift values corresponding to the predictors (should be in the same order as the predictors).
+    comp : int, optional (default=0)
+        The component index to plot (0 corresponds to the first component).
+    vip_threshold : float, optional (default=1.0)
+        The VIP threshold. Predictors with VIP >= vip_threshold will be highlighted.
+    output_filename : str or None, optional (default=None)
+        If provided, the plot is saved to this file.
+    show_fig : bool, optional (default=True)
+        If True, display the plot interactively.
+    figure_size : tuple, optional (default=(10,6))
+        Figure size.
+    
+    Returns
+    -------
+    None
+    """
+    # Get the loadings for the selected component
+    loadings = pls_model.x_loadings_[:, comp]  # shape (n_predictors,)
+    
+    # Calculate VIP scores for all predictors
+    vip = calculate_vip(pls_model)
+    
+    plt.figure(figsize=figure_size)
+    
+    # Plot the continuous trace (line) for loadings
+    plt.plot(chemical_shift, loadings, '-k', linewidth=1.5, label='Loadings Trace')
+    
+    # Overlay markers at each chemical shift
+    for j in range(len(loadings)):
+        # Choose marker color based on VIP and sign of loading
+        if vip[j] >= vip_threshold:
+            color = 'red' if loadings[j] >= 0 else 'blue'
+            marker_size = 8
+        else:
+            color = 'gray'
+            marker_size = 4
+        # Here, we use a square marker; you can change marker style if desired.
+        plt.plot(chemical_shift[j], loadings[j], marker='s', color=color, markersize=marker_size, markeredgecolor='k')
+    
+    plt.xlabel('Chemical Shift (ppm)')
+    plt.ylabel(f'Loadings (Component {comp+1})')
+    plt.title(f'PLS-DA Loadings (Component {comp+1})\nVIP Threshold = {vip_threshold}')
+    
+    # Create a legend manually
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='s', color='w', label=f'VIP ≥ {vip_threshold} (positive)', 
+               markerfacecolor='red', markersize=8, markeredgecolor='k'),
+        Line2D([0], [0], marker='s', color='w', label=f'VIP ≥ {vip_threshold} (negative)', 
+               markerfacecolor='blue', markersize=8, markeredgecolor='k'),
+        Line2D([0], [0], marker='s', color='w', label=f'VIP < {vip_threshold}', 
+               markerfacecolor='gray', markersize=1, markeredgecolor='k'),
+        Line2D([0], [0], color='k', lw=1.5, label='Loadings Trace')
+    ]
+    plt.legend(handles=legend_elements)
+    
+    # Typically, chemical shift axes are plotted in reverse (high ppm to low ppm)
+    plt.gca().invert_xaxis()
+    
+    if output_filename is not None:
+        output_path = os.path.join("images", output_filename)
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Loadings plot saved as: {output_path}")
+    if show_fig:
+        plt.show()
+    else:
+        plt.close()
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.model_selection import cross_val_score, GroupKFold
+from sklearn.metrics import r2_score
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.preprocessing import OneHotEncoder
+
+def evaluate_plsda_components(X, y, groups=None, n_splits=5, 
+                              save_fig=True, show_fig=True,
+                              output_dir='images', 
+                              output_file='PLSDA_Q2_R2_Scores.png',
+                              figure_size=(10, 5)):
+    """
+    Evaluate PLS-DA performance over a range of components using cross-validation.
+    
+    If y is non-numeric (i.e. contains class labels), it is one-hot encoded before evaluation.
+    For each number of components from 1 to the maximum allowed by both the full data and the smallest
+    training set among the folds, the function computes:
+      - Q² score: the mean cross-validated R² score (using GroupKFold)
+      - R² score: the coefficient of determination on the full dataset.
+    
+    Both scores are then plotted on a single overlayed plot, with options to save and/or display the plot.
+    
+    Parameters:
+        X (pd.DataFrame or np.array): Feature matrix.
+            (If samples are in columns and features in rows, be sure to transpose beforehand if needed.)
+        y (array-like or pd.Series): Target variable containing group/class labels.
+            If non-numeric, y will be one-hot encoded.
+        groups (array-like or None): Group labels for samples for GroupKFold.
+            If None and X has an index, X.index is used.
+        n_splits (int): Number of splits for GroupKFold cross-validation (default: 5).
+        save_fig (bool): If True, save the combined plot as an image file.
+        show_fig (bool): If True, display the plot interactively.
+        output_dir (str): Directory where the plot image will be saved.
+        output_file (str): Filename for the combined Q²/R² scores plot.
+        figure_size (tuple): Figure size for the plot.
+    
+    Returns:
+        q2_scores (np.array): Array of Q² scores for each number of components.
+        r2_scores (np.array): Array of R² scores for each number of components.
+    """
+    # Use X.index as groups if groups not provided and available
+    if groups is None:
+        try:
+            groups = X.index
+        except AttributeError:
+            raise ValueError("Groups not provided and X has no index attribute. Please supply groups explicitly.")
+    
+    # If y is a pandas Series, reindex it to match X's row order
+    if isinstance(y, pd.Series):
+        y = y.reindex(X.index)
+    
+    # If y is non-numeric, one-hot encode it
+    y = np.array(y)
+    if not np.issubdtype(y.dtype, np.number):
+        encoder = OneHotEncoder(sparse_output=False)
+        y = encoder.fit_transform(y.reshape(-1, 1))
+    
+    # Create GroupKFold cross-validator
+    group_kfold = GroupKFold(n_splits=n_splits)
+    
+    # Determine maximum number of components:
+    # Overall limit: n_samples - 1 or n_features
+    max_comp_full = min(X.shape[0] - 1, X.shape[1])
+    # Determine the smallest training set size over folds
+    fold_train_sizes = []
+    for train_idx, _ in group_kfold.split(X, y, groups=groups):
+        fold_train_sizes.append(len(train_idx))
+    min_train_size = min(fold_train_sizes)
+    max_comp_cv = min(min_train_size - 1, X.shape[1])
+    
+    num_components = min(max_comp_full, max_comp_cv)
+    if num_components < max_comp_full:
+        print(f"Limiting components to {num_components} based on the smallest training fold (size={min_train_size}).")
+    
+    # Initialize arrays to store scores
+    q2_scores = np.zeros(num_components)
+    r2_scores = np.zeros(num_components)
+    
+    # Loop over component numbers (from 1 to num_components)
+    for i in range(1, num_components + 1):
+        plsr = PLSRegression(n_components=i)
+        # Q²: Cross-validated R² score
+        q2 = cross_val_score(plsr, X, y, cv=group_kfold, groups=groups, scoring='r2')
+        q2_scores[i - 1] = np.mean(q2)
+        
+        # R²: Fit on full data and predict
+        plsr.fit(X, y)
+        y_pred = plsr.predict(X)
+        r2_scores[i - 1] = r2_score(y, y_pred)
+    
+    # Create combined plot for Q² and R² scores
+    plt.figure(figsize=figure_size)
+    comps = range(1, num_components + 1)
+    plt.plot(comps, q2_scores, marker='o', label='Q² Scores')
+    plt.plot(comps, r2_scores, marker='o', label='R² Scores', color='orange')
+    plt.xlabel('Number of Components')
+    plt.ylabel('Score')
+    plt.title('PLS-DA Q² and R² Scores')
+    plt.legend()
+    
+    if save_fig:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file)
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Combined Q²/R² Scores plot saved as: {output_path}")
+    if show_fig:
+        plt.show()
+    else:
+        plt.close()
+    
+    return q2_scores, r2_scores
+
+
+def calculate_vip(pls_model):
+    """
+    Calculate VIP (Variable Importance in Projection) scores for a fitted PLS model.
+    Assumes a single response variable.
+    
+    Parameters
+    ----------
+    pls_model : fitted PLSRegression model (from sklearn.cross_decomposition)
+    
+    Returns
+    -------
+    vip : np.array of shape (n_predictors,)
+        VIP scores for each predictor.
+    """
+    t = pls_model.x_scores_  # latent scores, shape (n_samples, n_components)
+    w = pls_model.x_weights_ # weights, shape (n_predictors, n_components)
+    q = pls_model.y_loadings_  # y loadings, shape (n_components, 1) for single response
+    A = w.shape[1]
+    p = w.shape[0]
+    
+    # Calculate the explained sum of squares for each component.
+    ssy = np.zeros(A)
+    for a in range(A):
+        # For a single response, q[a,0] is used.
+        ssy[a] = np.sum(t[:, a]**2) * (q[a, 0] ** 2)
+    total_ssy = np.sum(ssy)
+    
+    vip = np.zeros(p)
+    for j in range(p):
+        sum_term = 0.0
+        for a in range(A):
+            norm_w_a = np.linalg.norm(w[:, a])
+            sum_term += ((w[j, a] / norm_w_a) ** 2) * ssy[a]
+        vip[j] = np.sqrt(p * sum_term / total_ssy)
+    return vip
+
+def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0, 
+                      output_filename=None, show_fig=True, figure_size=(10, 6)):
+    """
+    Plot the loadings for a chosen component from a fitted PLS-DA model against the chemical shift axis.
+    
+    Variables with VIP scores greater than or equal to vip_threshold are highlighted:
+      - In red if the loading is positive.
+      - In blue if the loading is negative.
+    All other variables are shown in gray.
+    
+    Parameters
+    ----------
+    pls_model : fitted PLSRegression model
+        The PLS-DA model from which to extract loadings.
+    chemical_shift : array-like, shape (n_predictors,)
+        The chemical shift values corresponding to the predictors (should be in the same order as the predictors).
+    comp : int, optional (default=0)
+        The component index to plot (0 corresponds to the first component).
+    vip_threshold : float, optional (default=1.0)
+        The VIP threshold. Predictors with VIP >= vip_threshold will be highlighted.
+    output_filename : str or None, optional (default=None)
+        If provided, the plot is saved to this file.
+    show_fig : bool, optional (default=True)
+        If True, display the plot interactively.
+    figure_size : tuple, optional (default=(10,6))
+        Figure size.
+    
+    Returns
+    -------
+    None
+    """
+    # Get the loadings for the selected component
+    loadings = pls_model.x_loadings_[:, comp]  # shape (n_predictors,)
+    
+    # Calculate VIP scores for all predictors
+    vip = calculate_vip(pls_model)
+    
+    # Determine colors: if VIP >= threshold, use red for positive loadings, blue for negative; otherwise gray.
+    colors = []
+    for j in range(len(loadings)):
+        if vip[j] >= vip_threshold:
+            colors.append('red' if loadings[j] >= 0 else 'blue')
+        else:
+            colors.append('gray')
+    
+    plt.figure(figsize=figure_size)
+    plt.scatter(chemical_shift, loadings, c=colors, edgecolor='k')
+    plt.xlabel('Chemical Shift (ppm)')
+    plt.ylabel(f'Loadings (Component {comp+1})')
+    plt.title(f'PLS-DA Loadings (Component {comp+1})\nVIP Threshold = {vip_threshold}')
+    
+    # Create a legend manually
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', label=f'VIP ≥ {vip_threshold} (positive)', 
+               markerfacecolor='red', markersize=4, markeredgecolor='k'),
+        Line2D([0], [0], marker='o', color='w', label=f'VIP ≥ {vip_threshold} (negative)', 
+               markerfacecolor='blue', markersize=4, markeredgecolor='k'),
+        Line2D([0], [0], marker='o', color='w', label=f'VIP < {vip_threshold}', 
+               markerfacecolor='gray', markersize=1, markeredgecolor='k')
+    ]
+    plt.legend(handles=legend_elements)
+    # Typically, chemical shift axes are plotted in reverse (high ppm to low ppm)
+    plt.gca().invert_xaxis()
+    
+    if output_filename is not None:
+        plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+        print(f"Loadings plot saved as: {output_filename}")
+    if show_fig:
+        plt.show()
+    else:
+        plt.close()
+
+import os
+import plotly.graph_objects as go
+
+def plot_pca_loadings_with_spectra(data, normalized_df, pca_model, PC_choose=1, 
+                                   x_axis_col='Chemical Shift (ppm)', gap=100,
+                                   spectra_scale=0.1,
+                                   output_dir='images', output_file=None, 
+                                   save_fig=True, show_fig=True):
+    """
+    Creates a Plotly figure that overlays the PCA loading (for a specified principal component)
+    with the original normalized spectra in the background. The spectra are vertically offset 
+    by a specified gap (default 100 units) and scaled by spectra_scale so that their intensity 
+    better matches the PCA loading plot.
+    
+    Parameters:
+        data (pd.DataFrame): DataFrame containing the x-axis values (e.g. chemical shift).
+                             Used for the PCA loading trace.
+        normalized_df (pd.DataFrame): DataFrame with the original normalized spectra. It must include
+                                      the same x-axis column (x_axis_col) and one or more spectra columns.
+        pca_model: Fitted PCA model from which the loadings will be extracted.
+        PC_choose (int): Principal component number for which to plot the loading.
+        x_axis_col (str): Name of the x-axis column (default 'Chemical Shift (ppm)').
+        gap (float): Vertical gap (offset) between successive spectra.
+        spectra_scale (float): Factor to multiply the normalized spectra intensities by.
+        output_dir (str): Directory to save the plot HTML file.
+        output_file (str or None): Filename for the output HTML file. If None, a default name is generated.
+        save_fig (bool): If True, save the figure as an HTML file.
+        show_fig (bool): If True, display the interactive figure.
+    
+    Returns:
+        fig: The Plotly figure object.
+    """
+    if output_file is None:
+        output_file = f'PCA_PC{PC_choose}_Loadings_with_Spectra.html'
+        
+    fig = go.Figure()
+
+    # Add the original normalized spectra traces (background)
+    # We assume normalized_df has the x-axis column, and all other columns are spectra.
+    spectra_cols = [col for col in normalized_df.columns if col != x_axis_col]
+    for i, col in enumerate(spectra_cols):
+        offset = i * gap
+        fig.add_trace(go.Scatter(
+            x=normalized_df[x_axis_col],
+            y=(normalized_df[col] * spectra_scale) + offset,
+            mode='lines',
+            line=dict(color='gray'),
+            name=f'{col} (offset {offset})',
+            opacity=0.6,
+            showlegend=False  # Hide individual legend entries for clarity
+        ))
+
+    # Add the PCA loading trace (overlayed on top)
+    fig.add_trace(go.Scatter(
+        x=data[x_axis_col],
+        y=pca_model.components_[PC_choose - 1],
+        mode='lines',
+        line=dict(color='blue', width=3),
+        name=f'PC{PC_choose} Loading'
+    ))
+    
+    fig.update_layout(
+        title=f'PC{PC_choose} Loading Plot with Original Spectra Overlay',
+        xaxis_title=x_axis_col,
+        yaxis_title='Loading Value / Offset Spectra',
+        legend_title='Component',
+        xaxis=dict(autorange='reversed')
+    )
+    
+    if save_fig:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file)
+        fig.write_html(output_path)
+        print(f"Plot saved as: {output_path}")
+    
+    if show_fig:
+        fig.show()
+    
+    return fig
+  
+
+# Hierarchical Cluster Analysis (HCA)
+import plotly.figure_factory as ff
+from scipy.cluster.hierarchy import linkage, fcluster
+
+def perform_hca(
+    data,
+    metadata,
+    group_col="ATTRIBUTE_group",
+    sample_id_col="ATTRIBUTE_localsampleid",
+    method="ward",
+    metric="euclidean",
+    n_clusters=None,
+    output_dir="images",
+    dendrogram_filename=None,
+    show_fig=True
+):
+    """
+    Perform Hierarchical Cluster Analysis (HCA) on the sample data and generate an interactive dendrogram.
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Normalized feature matrix with columns as samples and rows as features.
+    metadata : pd.DataFrame
+        Metadata DataFrame containing sample information. Must include the sample_id_col and group_col.
+    group_col : str
+        Column in metadata that contains group labels.
+    sample_id_col : str
+        Column in metadata that matches the sample IDs in data’s columns.
+    method : str
+        The linkage algorithm to use (e.g., "ward", "single", "complete"). Default is "ward".
+    metric : str
+        The distance metric to use (e.g., "euclidean", "cosine"). Default is "euclidean".
+    n_clusters : int or None
+        If provided, the function will assign cluster memberships using the specified number of clusters.
+    output_dir : str
+        Directory where the dendrogram HTML file will be saved if dendrogram_filename is provided.
+    dendrogram_filename : str or None
+        If provided, the interactive dendrogram is saved as an HTML file with this name in output_dir.
+    show_fig : bool
+        If True, the interactive Plotly dendrogram is displayed.
+    
+    Returns
+    -------
+    result_dict : dict
+        Dictionary containing:
+          - "dendrogram_fig": The Plotly figure for the dendrogram.
+          - "linkage_matrix": The linkage matrix computed for clustering.
+          - "cluster_assignments": (Optional) A pandas Series mapping sample IDs to their cluster labels (if n_clusters is provided).
+    """
+    import os
+    import pandas as pd
+    from scipy.cluster.hierarchy import linkage, fcluster
+    import plotly.figure_factory as ff
+
+    # Transpose data so that rows represent samples
+    X = data.drop(columns="Chemical Shift (ppm)").transpose()  # shape: [n_samples, n_features]
+    
+    # Compute the linkage matrix using the specified method and metric
+    Z = linkage(X, method=method, metric=metric)
+    
+    # Create a dendrogram figure using Plotly's figure factory
+    # The labels are the sample IDs from X.index.
+    dendro_fig = ff.create_dendrogram(
+        X.values,
+        orientation='left',
+        labels=list(X.index),
+        linkagefun=lambda x: Z,
+        color_threshold=0  # Let Plotly choose the default color cutoff
+    )
+    
+    # Merge metadata for hover labels
+    meta_lookup = metadata.set_index(sample_id_col)[group_col].to_dict()
+    for trace in dendro_fig.data:
+        if trace.text is not None:
+            trace.text = [f"{lbl}<br>Group: {meta_lookup.get(lbl, 'NA')}" for lbl in trace.text]
+    
+    # If n_clusters is specified, assign clusters using fcluster.
+    cluster_assignments = None
+    if n_clusters is not None:
+        clusters = fcluster(Z, t=n_clusters, criterion='maxclust')
+        # Map sample IDs to clusters
+        cluster_assignments = pd.Series(clusters, index=X.index, name='Cluster')
+        print("Cluster assignments:")
+        print(cluster_assignments)
+    
+    # Save the dendrogram if a filename is provided.
+    if dendrogram_filename is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, dendrogram_filename)
+        dendro_fig.write_html(output_path)
+        print(f"Dendrogram saved as: {output_path}")
+    
+    if show_fig:
+        dendro_fig.show()
+    
+    result_dict = {
+        "dendrogram_fig": dendro_fig,
+        "linkage_matrix": Z,
+        "cluster_assignments": cluster_assignments
+    }
+    return result_dict
+
+import os
+import csv
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.decomposition import PCA
+
+def perform_opls_da(
+    data,
+    metadata,
+    group_col="ATTRIBUTE_group",
+    sample_id_col="ATTRIBUTE_localsampleid",
+    n_components=2,
+    output_dir="images",
+    score_plot_filename=None,
+    show_fig=True
+):
+    """
+    Perform Orthogonal PLS-DA (OPLS-DA) by:
+      1. One-hot encoding the class labels.
+      2. Fitting a PLSRegression model with one predictive component.
+      3. Removing the predictive variation to get orthogonal components using PCA on the residual matrix.
+      4. Plotting the predictive (LV1) vs. the first orthogonal component (LV2).
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Normalized feature matrix with columns as samples (rows as features).
+        (Does NOT include the chemical shift axis.)
+    metadata : pd.DataFrame
+        DataFrame containing sample metadata. Must include the sample_id_col (matching data columns)
+        and a grouping column (group_col) for classification.
+    group_col : str
+        Column in metadata that contains the class/group labels.
+    sample_id_col : str
+        Column in metadata that matches the sample IDs in data’s columns.
+    n_components : int
+        Total number of components: 1 predictive + (n_components - 1) orthogonal.
+        Default is 2 so that a 2D score plot can be generated.
+    output_dir : str
+        Directory where the HTML plot will be saved if score_plot_filename is provided.
+    score_plot_filename : str or None
+        If provided, the interactive score plot is saved as an HTML file with this name in output_dir.
+    show_fig : bool
+        If True, the interactive Plotly figure is displayed.
+
+    Returns
+    -------
+    model_dict : dict
+        Dictionary containing:
+          - "pls_model": the fitted PLSRegression model (predictive component).
+          - "pca_ortho": the PCA model fitted on the residual (orthogonal components) (or None if n_components==1).
+          - "scores_df": DataFrame of latent variable scores (predictive and orthogonal) merged with metadata.
+    """
+    # Ensure output directory exists if saving the plot.
+    if score_plot_filename is not None:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # Transpose data so that rows are samples and columns are features.
+    X = data.transpose()  # shape: [n_samples, n_features]
+
+    # Align metadata with the sample IDs from X.
+    sample_index_df = pd.DataFrame({sample_id_col: X.index})
+    merged_df = sample_index_df.merge(metadata, on=sample_id_col, how='left')
+
+    # One-hot encode the group labels.
+    groups = merged_df[group_col].astype(str).values.reshape(-1, 1)
+    encoder = OneHotEncoder(sparse_output=False)
+    Y = encoder.fit_transform(groups)  # shape: [n_samples, n_classes]
+
+    # --- Step 1: Fit PLSRegression for the predictive component ---
+    pls_model = PLSRegression(n_components=1)
+    pls_model.fit(X, Y)
+    t_pred = pls_model.x_scores_      # predictive scores; shape: [n_samples, 1]
+    p_pred = pls_model.x_loadings_    # predictive loadings; shape: [n_features, 1]
+
+    # --- Step 2: Remove predictive variation to compute orthogonal variation ---
+    # Reconstruct X from the predictive component.
+    X_pred = t_pred.dot(p_pred.T)
+    # Residual matrix (X_orth) contains the orthogonal variation.
+    X_res = X - X_pred
+
+    # --- Step 3: Extract orthogonal component(s) from the residual using PCA ---
+    n_ortho = n_components - 1  # number of orthogonal components
+    if n_ortho > 0:
+        pca_ortho = PCA(n_components=n_ortho)
+        t_ortho = pca_ortho.fit_transform(X_res)  # shape: [n_samples, n_ortho]
+    else:
+        pca_ortho = None
+        t_ortho = np.empty((X.shape[0], 0))
+    
+    # --- Step 4: Build the scores DataFrame ---
+    # Concatenate the predictive score with orthogonal scores.
+    scores = np.concatenate([t_pred, t_ortho], axis=1)  # shape: [n_samples, n_components]
+    lv_names = ['Predictive'] + [f"Orthogonal{i+1}" for i in range(n_ortho)]
+    scores_df = pd.DataFrame(scores, columns=lv_names, index=X.index)
+    scores_df = scores_df.reset_index().rename(columns={"index": sample_id_col})
+    scores_df = scores_df.merge(merged_df[[sample_id_col, group_col]], on=sample_id_col, how='left')
+    
+    # --- Step 5: Plot the score plot (Predictive vs. first Orthogonal) ---
+    if n_components >= 2:
+        fig = px.scatter(
+            scores_df,
+            x="Predictive",
+            y="Orthogonal1",
+            color=group_col,
+            hover_data=[sample_id_col],
+            title="OPLS-DA Score Plot (Predictive vs. Orthogonal)",
+            labels={"Predictive": "Predictive Component", "Orthogonal1": "Orthogonal Component 1"}
+        )
+        if score_plot_filename is not None:
+            html_path = os.path.join(output_dir, score_plot_filename)
+            fig.write_html(html_path)
+        if show_fig:
+            fig.show()
+    else:
+        print("n_components < 2, so no 2D score plot was generated.")
+    
+    model_dict = {"pls_model": pls_model, "pca_ortho": pca_ortho, "scores_df": scores_df}
+    return model_dict
+
+def plot_oplsda_predictive_loadings(data, model_dict, x_axis_col='RT(min)', 
+                                    output_dir='images', output_file=None, 
+                                    save_fig=True, show_fig=True):
+    """
+    Plot the predictive loadings from the OPLS-DA model.
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        DataFrame containing the x-axis values (e.g., retention time, chemical shift).
+    model_dict : dict
+        Dictionary returned by perform_opls_da.
+    x_axis_col : str
+        Column in data to use for the x-axis.
+    output_dir : str
+        Directory where the plot will be saved.
+    output_file : str or None
+        Filename for saving the plot. Defaults to 'OPLSDA_Predictive_Loadings.html' if None.
+    save_fig : bool
+        Whether to save the figure.
+    show_fig : bool
+        Whether to display the figure.
+    
+    Returns
+    -------
+    fig : plotly.graph_objects.Figure
+        The predictive loadings plot.
+    """
+    # Predictive loadings from the PLS model.
+    loadings = model_dict["pls_model"].x_loadings_
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data[x_axis_col],
+        y=loadings[:, 0],
+        mode='lines',
+        name='OPLS-DA Predictive Loading'
+    ))
+    fig.update_layout(
+        title='OPLS-DA Predictive Loading Plot',
+        xaxis_title=x_axis_col,
+        yaxis_title='Loading Value'
+    )
+    if save_fig:
+        if output_file is None:
+            output_file = 'OPLSDA_Predictive_Loadings.html'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file)
+        fig.write_html(output_path)
+        print(f"Predictive loadings plot saved as: {output_path}")
+    if show_fig:
+        fig.show()
+    return fig
+
+def plot_oplsda_orthogonal_loadings(data, model_dict, component=1, x_axis_col='RT(min)', 
+                                    output_dir='images', output_file=None, 
+                                    save_fig=True, show_fig=True):
+    """
+    Plot the orthogonal loadings from the OPLS-DA model (from the PCA on the residual).
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        DataFrame containing the x-axis values (e.g., retention time, chemical shift).
+    model_dict : dict
+        Dictionary returned by perform_opls_da.
+    component : int
+        The orthogonal component number to plot (1-indexed).
+    x_axis_col : str
+        Column in data to use for the x-axis.
+    output_dir : str
+        Directory where the plot will be saved.
+    output_file : str or None
+        Filename for saving the plot. Defaults to 'OPLSDA_Orthogonal_Component_1_Loadings.html' if None.
+    save_fig : bool
+        Whether to save the figure.
+    show_fig : bool
+        Whether to display the figure.
+    
+    Returns
+    -------
+    fig : plotly.graph_objects.Figure
+        The orthogonal loadings plot.
+    """
+    pca_ortho = model_dict.get("pca_ortho", None)
+    if pca_ortho is None:
+        raise ValueError("No orthogonal components are available in the OPLS-DA model.")
+    
+    if component < 1 or component > pca_ortho.components_.shape[0]:
+        raise ValueError(f"Component must be between 1 and {pca_ortho.components_.shape[0]}, got {component}")
+    
+    # PCA components are stored in rows; select the desired orthogonal component.
+    loadings = pca_ortho.components_[component - 1]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=data[x_axis_col],
+        y=loadings,
+        mode='lines',
+        name=f'OPLS-DA Orthogonal Component {component} Loading'
+    ))
+    fig.update_layout(
+        title=f'OPLS-DA Orthogonal Component {component} Loading Plot',
+        xaxis_title=x_axis_col,
+        yaxis_title='Loading Value'
+    )
+    if save_fig:
+        if output_file is None:
+            output_file = f'OPLSDA_Orthogonal_Component_{component}_Loadings.html'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file)
+        fig.write_html(output_path)
+        print(f"Orthogonal loadings plot saved as: {output_path}")
+    if show_fig:
+        fig.show()
+    return fig
+
+def calculate_opls_vip_scores(model_dict, X):
+    """
+    Calculate VIP (Variable Importance in Projection) scores for the predictive component
+    from the OPLS-DA model.
+    
+    Parameters
+    ----------
+    model_dict : dict
+        Dictionary returned by perform_opls_da.
+    X : pd.DataFrame
+        DataFrame of features (with samples as rows). The columns should correspond to the variables.
+    
+    Returns
+    -------
+    vip : np.array
+        Array of VIP scores for each variable.
+    """
+    pls_model = model_dict["pls_model"]
+    t = pls_model.x_scores_
+    w = pls_model.x_weights_
+    q = pls_model.y_loadings_
+    p, h = w.shape
+    vip = np.zeros((p,))
+    s = np.diag(t.T @ t @ q.T @ q).reshape(h, -1)
+    total_s = np.sum(s)
+    for i in range(p):
+        weight = np.array([(w[i, j] / np.linalg.norm(w[:, j]))**2 for j in range(h)])
+        vip[i] = np.sqrt(p * (s.T @ weight) / total_s)
+    return vip
+
+def analyze_opls_vip_scores(model_dict, X, top_n=10,
+                            save_df=False, output_dir='images', output_file_df=None,
+                            plot_fig=False, save_fig=False, output_file_plot=None, show_fig=True):
+    """
+    Analyze and optionally save/plot the top VIP scores for the predictive component from the OPLS-DA model.
+    
+    Parameters
+    ----------
+    model_dict : dict
+        Dictionary returned by perform_opls_da.
+    X : pd.DataFrame
+        Feature DataFrame with variables as columns.
+    top_n : int
+        Number of top VIP scores to return.
+    save_df : bool
+        Whether to save the VIP scores as a CSV file.
+    output_dir : str
+        Directory for saving outputs.
+    output_file_df : str or None
+        Filename for saving the VIP scores CSV.
+    plot_fig : bool
+        Whether to plot the VIP scores.
+    save_fig : bool
+        Whether to save the VIP scores plot.
+    output_file_plot : str or None
+        Filename for the VIP scores plot.
+    show_fig : bool
+        Whether to display the plot.
+    
+    Returns
+    -------
+    top_vip : pd.DataFrame
+        DataFrame of the top VIP scores.
+    """
+    vip = calculate_opls_vip_scores(model_dict, X)
+    vip_df = pd.DataFrame({'Variable': X.columns, 'VIP Score': vip})
+    vip_df = vip_df.sort_values(by='VIP Score', ascending=False)
+    top_vip = vip_df.head(top_n)
+    if save_df:
+        if output_file_df is None:
+            output_file_df = 'OPLS_VIP_scores.csv'
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, output_file_df)
+        top_vip.to_csv(output_path, index=False)
+        print(f"VIP scores saved as: {output_path}")
+    if plot_fig:
+        fig = px.bar(top_vip, x='Variable', y='VIP Score',
+                     title='Top VIP Scores (OPLS-DA)',
+                     text='VIP Score')
+        fig.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+        fig.update_layout(uniformtext_minsize=8, uniformtext_mode='hide')
+        if save_fig:
+            if output_file_plot is None:
+                output_file_plot = 'OPLS_VIP_scores_plot.html'
+            os.makedirs(output_dir, exist_ok=True)
+            plot_path = os.path.join(output_dir, output_file_plot)
+            fig.write_html(plot_path)
+            print(f"VIP scores plot saved as: {plot_path}")
+        if show_fig:
+            fig.show()
+    return top_vip
+
+
+
+
+
+def plot_hca_heatmap(
+    data,
+    metadata,
+    sample_id_col="ATTRIBUTE_localsampleid",
+    group_col="ATTRIBUTE_group",
+    output_dir="images",
+    heatmap_filename=None,
+    show_fig=True
+):
+    """
+    Generate a heatmap of the feature matrix with samples clustered by hierarchical clustering.
+    Samples are ordered based on the dendrogram.
+    
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Normalized feature matrix with columns as samples.
+    metadata : pd.DataFrame
+        Metadata DataFrame containing sample information.
+    sample_id_col : str
+        Column in metadata that contains sample IDs.
+    group_col : str
+        Column in metadata that contains group labels.
+    output_dir : str
+        Directory where the heatmap HTML file will be saved if heatmap_filename is provided.
+    heatmap_filename : str or None
+        If provided, the heatmap is saved as an HTML file with this name in output_dir.
+    show_fig : bool
+        If True, the interactive heatmap is displayed.
+    
+    Returns
+    -------
+    fig : plotly.graph_objects.Figure
+        The heatmap figure.
+    """
+    import plotly.express as px
+    # Transpose data so that rows are samples
+    X = data.transpose()  # shape: [n_samples, n_features]
+    
+    # Compute hierarchical clustering order
+    Z = linkage(X, method="ward", metric="euclidean")
+    # Use the dendrogram to get the order of sample indices
+    dendro = ff.create_dendrogram(X.values, orientation='left', linkagefun=lambda x: Z)
+    ordered_sample_ids = dendro['layout']['yaxis']['ticktext']
+    
+    # Reorder the DataFrame based on the dendrogram order
+    X_ordered = X.loc[ordered_sample_ids]
+    
+    # Add group information from metadata for annotation
+    meta_lookup = metadata.set_index(sample_id_col)[group_col].to_dict()
+    group_labels = [meta_lookup.get(sid, 'NA') for sid in X_ordered.index]
+    
+    # Create a heatmap using Plotly Express
+    fig = px.imshow(
+        X_ordered,
+        labels=dict(x="Features", y="Samples", color="Intensity"),
+        x=X_ordered.columns,
+        y=X_ordered.index,
+        aspect="auto",
+        title="HCA Heatmap"
+    )
+    # Add group labels as hover information
+    fig.update_traces(
+        hovertemplate="<b>Sample</b>: %{y}<br><b>Group</b>: " +
+                      "%{customdata}<br><b>Feature</b>: %{x}<br><b>Intensity</b>: %{z}"
+    )
+    fig.update_traces(customdata=np.array(group_labels).reshape(-1, 1))
+    
+    if heatmap_filename is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, heatmap_filename)
+        fig.write_html(output_path)
+        print(f"Heatmap saved as: {output_path}")
+    
+    if show_fig:
+        fig.show()
+    
+    return fig
+
+
+
+# --------------------------------------------------------------------------
+#               8) STOCSY FUNCTIONS
+# --------------------------------------------------------------------------
+def STOCSY(target, X, ppm):
+    import mpld3
+    from matplotlib.collections import LineCollection  # import directly
+    if type(target) == float:
+        idx = np.abs(ppm - target).idxmin()
+        target_vect = X.iloc[idx]
+    else:
+        target_vect = target
+    corr = (stats.zscore(target_vect.T, ddof=1) @ stats.zscore(X.T, ddof=1)) / ((X.T.shape[0]) - 1)
+    covar = (target_vect - target_vect.mean()) @ (X.T - np.tile(X.T.mean(), (X.T.shape[0], 1))) / ((X.T.shape[0]) - 1)
+    
+    x = np.linspace(0, len(covar), len(covar))
+    y = covar
+    points = np.array([x, y]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    
+    fig, axs = plt.subplots(1, 1, sharex=True, sharey=True, figsize=(16,4))
+    norm = plt.Normalize(corr.min(), corr.max())
+    # Use LineCollection from matplotlib.collections (aliased as LineCollection)
+    lc = LineCollection(segments, cmap='jet', norm=norm)
+    lc.set_array(corr)
+    lc.set_linewidth(2)
+    line = axs.add_collection(lc)
+    fig.colorbar(line, ax=axs)
+    
+    axs.set_xlim(x.min(), x.max())
+    axs.set_ylim(y.min(), y.max())
+    axs.invert_xaxis()
+    
+    minppm = min(ppm)
+    maxppm = max(ppm)
+    ticksx = []
+    tickslabels = []
+    if maxppm < 30:
+        ticks = np.linspace(int(math.ceil(minppm)), int(maxppm), int(maxppm) - math.ceil(minppm) + 1)
+    else:
+        ticks = np.linspace(int(math.ceil(minppm / 10.0)) * 10, (int(math.ceil(maxppm / 10.0)) * 10) - 10, int(math.ceil(maxppm / 10.0)) - int(math.ceil(minppm / 10.0)))
+    currenttick = 0
+    for ppm_val in ppm:
+        if currenttick < len(ticks) and ppm_val > ticks[currenttick]:
+            position = int((ppm_val - minppm) / (maxppm - minppm) * max(x))
+            if position < len(x):
+                ticksx.append(x[position])
+                tickslabels.append(ticks[currenttick])
+            currenttick += 1
+    plt.xticks(ticksx, tickslabels, fontsize=12)
+    
+    axs.set_xlabel('ppm', fontsize=14)
+    axs.set_ylabel(f"Covariance with \n signal at {target:.2f} ppm", fontsize=14)
+    axs.set_title(f'STOCSY from signal at {target:.2f} ppm', fontsize=16)
+    
+    text = axs.text(1, 1, '')
+    lnx = plt.plot([60,60], [0,1.5], color='black', linewidth=0.3)
+    lny = plt.plot([0,100], [1.5,1.5], color='black', linewidth=0.3)
+    lnx[0].set_linestyle('None')
+    lny[0].set_linestyle('None')
+    
+    def hover(event):
+        if event.inaxes == axs:
+            inv = axs.transData.inverted()
+            maxcoord = axs.transData.transform((x[0], 0))[0]
+            mincoord = axs.transData.transform((x[-1], 0))[0]
+            ppm_val = ((maxcoord - mincoord) - (event.x - mincoord)) / (maxcoord - mincoord) * (maxppm - minppm) + minppm
+            cov_val = covar[int(((maxcoord - mincoord) - (event.x - mincoord)) / (maxcoord - mincoord) * len(covar))]
+            cor_val = corr[int(((maxcoord - mincoord) - (event.x - mincoord)) / (maxcoord - mincoord) * len(corr))]
+            text.set_visible(True)
+            text.set_position((event.xdata, event.ydata))
+            text.set_text('{:.2f}'.format(ppm_val) + " ppm, covariance: " + '{:.6f}'.format(cov_val) + ", correlation: " + '{:.2f}'.format(cor_val))
+            lnx[0].set_data([event.xdata, event.xdata], [-1, 1])
+            lnx[0].set_linestyle('--')
+            lny[0].set_data([x[0], x[-1]], [cov_val, cov_val])
+            lny[0].set_linestyle('--')
+        else:
+            text.set_visible(False)
+            lnx[0].set_linestyle('None')
+            lny[0].set_linestyle('None')
+        fig.canvas.draw_idle()
+    
+    fig.canvas.mpl_connect("motion_notify_event", hover)    
+    plt.show()
+    
+    if not os.path.exists('images'):
+        os.mkdir('images')
+    plt.savefig(f"images/stocsy_from_{target}.pdf", transparent=True, dpi=300)
+    
+    html_str = mpld3.fig_to_html(fig)
+    with open(f"images/stocsy_interactive_{target}ppm.html", "w") as f:
+        f.write(html_str)
+    
+    return corr, covar
+
+
+def STOCSY_interactive(target, X, ppm):
+    if isinstance(target, float):
+        idx = np.argmin(np.abs(np.array(ppm) - target))
+        target_vect = X.iloc[idx]
+    else:
+        target_vect = target
+    corr = (stats.zscore(target_vect.T, ddof=1) @ stats.zscore(X.T, ddof=1)) / ((X.T.shape[0]) - 1)
+    covar = (target_vect - target_vect.mean()) @ (X.T - np.tile(X.T.mean(), (X.T.shape[0], 1))) / ((X.T.shape[0]) - 1)
+    df = pd.DataFrame({'ppm': ppm, 'covar': covar, 'corr': corr})
+    df = df.sort_values('ppm', ascending=False)
+    fig = go.Figure(data=go.Scatter(
+        x=df['ppm'],
+        y=df['covar'],
+        mode='lines+markers',
+        marker=dict(
+            color=df['corr'],
+            colorscale='jet',
+            colorbar=dict(title='Correlation'),
+            size=6
+        ),
+        line=dict(width=2),
+        hovertemplate='Chemical Shift: %{x:.2f} ppm<br>Covariance: %{y:.6f}<br>Correlation: %{marker.color:.2f}<extra></extra>'
+    ))
+    fig.update_layout(
+        title=f'STOCSY from signal at {target:.2f} ppm',
+        xaxis_title='ppm',
+        yaxis_title=f"Covariance with signal at {target:.2f} ppm",
+        xaxis_autorange='reversed'
+    )
+    fig.show()
+    return corr, covar
+
+# --------------------------------------------------------------------------
+#                    13) Data-Export
+# --------------------------------------------------------------------------
+
+import os
+import csv
+import re
+
+def sanitize_string(s):
+    """
+    Sanitize a string so that it contains only English letters, numbers, and underscores.
+    """
+    return re.sub(r'[^a-zA-Z0-9_]', '', s)
+
+def export_metaboanalyst(aligned_df, df_metadata,
+                         sample_id_col="NMR_filename",
+                         class_col="ATTRIBUTE_classification",
+                         output_file="metaboanalyst_input.csv"):
+    """
+    Export NMR data to a CSV suitable for MetaboAnalyst with the following format:
+      - First row: column headers (e.g., "Chemical Shift (ppm)" plus sample IDs)
+      - Second row: blank under "Chemical Shift (ppm)", then each sample's classification
+      - Remaining rows: the actual data from aligned_df
+
+    The function filters the metadata to include only samples present in the data.
+    It also sanitizes sample IDs and classification values so that only English letters,
+    numbers, and underscores remain.
+
+    Parameters
+    ----------
+    aligned_df : pd.DataFrame
+        NMR data with the first column "Chemical Shift (ppm)" and subsequent columns as sample intensities.
+        The column names after the first one must correspond to sample IDs.
+    df_metadata : pd.DataFrame
+        Metadata DataFrame containing sample information. Must include:
+          - sample_id_col: the column with sample IDs.
+          - class_col: the column with class/group information for each sample.
+    sample_id_col : str, optional
+        The column in df_metadata that contains sample IDs.
+    class_col : str, optional
+        The column in df_metadata that contains the sample classification.
+    output_file : str, optional
+        The output CSV filename.
+
+    Returns
+    -------
+    new_df : pd.DataFrame
+        The new DataFrame (with only valid sample columns) that is saved to CSV.
+    """
+    # --- Step 1: Sanitize column headers in aligned_df ---
+    # Assume the first column is "Chemical Shift (ppm)" and keep it unchanged.
+    orig_col_names = list(aligned_df.columns)
+    # For sample columns (all except the first), sanitize their names.
+    sanitized_sample_cols = [sanitize_string(s) for s in orig_col_names[1:]]
+    sanitized_col_names = [orig_col_names[0]] + sanitized_sample_cols
+    aligned_df = aligned_df.copy()
+    aligned_df.columns = sanitized_col_names
+
+    # --- Step 2: Identify sample columns (all except the first "Chemical Shift (ppm)") ---
+    sample_cols = sanitized_col_names[1:]
+    
+    # --- Step 3: Filter and sanitize metadata ---
+    # Create a copy of the metadata and sanitize the sample IDs.
+    meta = df_metadata.copy()
+    meta[sample_id_col] = meta[sample_id_col].apply(sanitize_string)
+    # Also sanitize the classification values.
+    meta[class_col] = meta[class_col].apply(sanitize_string)
+    # Set the index using the sanitized sample IDs.
+    meta_indexed = meta.set_index(sample_id_col)
+    # Reindex metadata to include only sample IDs from aligned_df.
+    classification_series = meta_indexed.reindex(sample_cols)[class_col]
+    
+    # Optionally, drop any sample columns with missing metadata.
+    valid_sample_cols = classification_series.dropna().index.tolist()
+    if len(valid_sample_cols) < len(sample_cols):
+        missing = set(sample_cols) - set(valid_sample_cols)
+        print(f"Warning: The following sample IDs are missing metadata and will be excluded: {missing}")
+    
+    # --- Step 4: Build the classification row ---
+    # First cell is blank (for "Chemical Shift (ppm)"), then classification values for valid sample columns.
+    classification_row = [""]
+    classification_row.extend(classification_series.loc[valid_sample_cols].values)
+    
+    # --- Step 5: Build a new DataFrame using only "Chemical Shift (ppm)" and valid sample columns ---
+    new_df = aligned_df[['Chemical Shift (ppm)'] + valid_sample_cols].copy()
+    
+    # --- Step 6: Write the CSV with the classification row after the header ---
+    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+    with open(output_file, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        # Write header row.
+        writer.writerow(new_df.columns.tolist())
+        # Write classification row.
+        writer.writerow(classification_row)
+        # Write data rows.
+        for i in range(len(new_df)):
+            writer.writerow(new_df.iloc[i].values)
+    
+    print(f"MetaboAnalyst input CSV saved as: {output_file}")
+    return new_df
+
+
+# --------------------------------------------------------------------------
+#                    14) Data-Processing Report
+# --------------------------------------------------------------------------
+def print_data_processing_report(start_rt, end_rt, samples_to_remove,
+                                 aligned_method, normalization_method,
+                                 scale_method):
+    """
+    Print a concise data-processing report for LC analysis.
+    """
+    samples_str = ", ".join(samples_to_remove) if samples_to_remove else "None"
+    report = f"""
+Data-Processing Report
+----------------------
+1. Unwanted outer RT regions removed: {start_rt}–{end_rt} min
+2. Removed samples: {samples_str}
+3. Alignment method: {aligned_method}
+4. Normalization method: {normalization_method}
+5. Scaling method: {scale_method}
+    """
+    print(report.strip())
+
+# --------------------------------------------------------------------------
+#                       End of data_processing_NMR.py
+# --------------------------------------------------------------------------
