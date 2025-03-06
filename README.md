@@ -59,7 +59,7 @@ The repository includes a Jupyter Notebook that walks through a full data proces
 
 ---
 
-## Optionals
+## Optionals for alignment
 ``` python
 #### Optional: Align by group
 group_class = "ATTRIBUTE_group"
@@ -137,6 +137,22 @@ dp.create_nmr_plot(final_aligned_df,
                     output_file='Aligned_PAFFT_nmr_spectra_byCHemShift.html',
                     show_fig=False)
 
+```
+### Optionals for STOCSY
+``` python
+# STOCSY by group
+group_class = "ATTRIBUTE_group"
+group_specification = "Cecal 4.1"
+
+# Get the filenames corresponding to the specified group.
+target_ids = df_metadata.loc[df_metadata[group_class] == group_specification, "ATTRIBUTE_localsampleid"]
+
+# Subset aligned_df by keeping the "Chemical Shift (ppm)" column and only those columns that match the filenames.
+df_subset = aligned_df[["Chemical Shift (ppm)"] + list(target_ids)]
+
+dp.STOCSY(0.88, # target in ppm
+               df_subset.drop(columns='Chemical Shift (ppm)'), # data
+               df_subset['Chemical Shift (ppm)']) # chemical shift 
 ```
 
 ## Contributing
