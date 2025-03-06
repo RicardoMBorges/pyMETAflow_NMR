@@ -154,6 +154,42 @@ dp.STOCSY(0.88, # target in ppm
                df_subset.drop(columns='Chemical Shift (ppm)'), # data
                df_subset['Chemical Shift (ppm)']) # chemical shift 
 ```
+### Optionals for PCA
+``` python
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+
+# Transpose normalized_df so that rows are samples and columns are features.
+# (Assuming normalized_df does not include the "Chemical Shift (ppm)" axis)
+X = normalized_df.transpose()
+
+# Perform PCA (here we extract 2 components for visualization)
+pca = PCA(n_components=2)
+principal_components = pca.fit_transform(X)
+
+# Create a DataFrame with the PCA scores.
+pca_df = pd.DataFrame(data=principal_components, 
+                      columns=['PC1', 'PC2'],
+                      index=X.index)  # sample names from normalized_df
+
+# Merge the PCA scores with the metadata.
+# We assume that the index in X (sample names) corresponds to df_metadata["ATTRIBUTE_localsampleid"].
+pca_df = pca_df.merge(df_metadata[['ATTRIBUTE_localsampleid', 'ATTRIBUTE_group']],
+                      left_index=True, right_on='ATTRIBUTE_localsampleid', how='left')
+
+# Plot the PCA scores with points colored by group classification.
+plt.figure(figsize=(8,6))
+sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue='ATTRIBUTE_group', 
+                palette='hls', s=100)
+
+plt.title("PCA Analysis Colored by Group Classification")
+plt.xlabel("Principal Component 1")
+plt.ylabel("Principal Component 2")
+plt.legend(title="Group")
+plt.show()
+```
 
 ## Contributing
 
