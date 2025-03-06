@@ -60,7 +60,7 @@ The repository includes a Jupyter Notebook that walks through a full data proces
 ---
 
 ## Optionals
--
+``` python
 #### Optional: Align by group
 group_class = "ATTRIBUTE_group"
 group_specification = "Cecal 4.1"
@@ -136,8 +136,8 @@ dp.create_nmr_plot(final_aligned_df,
                     output_dir='images', 
                     output_file='Aligned_PAFFT_nmr_spectra_byCHemShift.html',
                     show_fig=False)
-"""
--
+
+```
 
 ## Contributing
 
