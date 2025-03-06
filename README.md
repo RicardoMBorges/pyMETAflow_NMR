@@ -138,6 +138,18 @@ dp.create_nmr_plot(final_aligned_df,
                     show_fig=False)
 
 ```
+
+### Optional for normalization and scaling check
+```
+# Plot data distribuition (Normalization Check after)
+os.makedirs('images', exist_ok=True)
+dp.plot_histogram_with_distribution(normalized_df, 
+                                    output_dir='images', 
+                                    file_name='histogram_with_distribution_curve_Normalized.html',
+                                   #log_scale=True,
+                                   x_range=(-10, 10))
+```
+
 ### Optionals for STOCSY
 ``` python
 # STOCSY by group
@@ -189,16 +201,6 @@ plt.xlabel("Principal Component 1")
 plt.ylabel("Principal Component 2")
 plt.legend(title="Group")
 plt.show()
-```
-### Optional for normalization and scaling check
-```
-# Plot data distribuition (Normalization Check after)
-os.makedirs('images', exist_ok=True)
-dp.plot_histogram_with_distribution(normalized_df, 
-                                    output_dir='images', 
-                                    file_name='histogram_with_distribution_curve_Normalized.html',
-                                   #log_scale=True,
-                                   x_range=(-10, 10))
 ```
 
 ## Contributing
