@@ -59,6 +59,86 @@ The repository includes a Jupyter Notebook that walks through a full data proces
 
 ---
 
+## Optionals
+-
+#### Optional: Align by group
+group_class = "ATTRIBUTE_group"
+group_specification = "Cecal 4.1"
+
+# Get the filenames corresponding to the specified group.
+target_ids = df_metadata.loc[df_metadata[group_class] == group_specification, "ATTRIBUTE_localsampleid"]
+
+# Subset aligned_df by keeping the "Chemical Shift (ppm)" column and only those columns that match the filenames.
+df_subset_1 = aligned_df[["Chemical Shift (ppm)"] + list(target_ids)]
+
+aligned_PAFFT_1 = dp.PAFFT_df(df_subset_1, 
+                           segSize_ppm= 0.08,  # segment size in ppm
+                           reference_idx=0,
+                           shift_ppm= 0.05)     # Maximum allowed shift per segment in ppm.
+
+
+group_specification = "Rectal 4.1"
+
+# Get the filenames corresponding to the specified group.
+target_ids = df_metadata.loc[df_metadata[group_class] == group_specification, "ATTRIBUTE_localsampleid"]
+
+# Subset aligned_df by keeping the "Chemical Shift (ppm)" column and only those columns that match the filenames.
+df_subset_2 = aligned_df[["Chemical Shift (ppm)"] + list(target_ids)]
+
+aligned_PAFFT_2 = dp.PAFFT_df(df_subset_2, 
+                           segSize_ppm= 0.08,  # segment size in ppm
+                           reference_idx=0,
+                           shift_ppm= 0.05)     # Maximum allowed shift per segment in ppm.
+
+aligned_PAFFT_G_1 = pd.merge(aligned_PAFFT_1, aligned_PAFFT_2, on="Chemical Shift (ppm)", how="outer")
+
+aligned_PAFFT_G = dp.PAFFT_df(aligned_PAFFT_G_1, 
+                           segSize_ppm= 0.08,  # segment size in ppm
+                           reference_idx=0,
+                           shift_ppm= 0.05)     # Maximum allowed shift per segment in ppm.
+
+dp.create_nmr_plot(aligned_PAFFT_G, 
+                    x_axis_col='Chemical Shift (ppm)', 
+                    start_column=1, 
+                    end_column=None, 
+                    title='Aligned_PAFFT_NMR Spectra Overlapping',
+                    xaxis_title='Chemical Shift (ppm)',
+                    yaxis_title='Intensity',
+                    legend_title='Samples',
+                    output_dir='images', 
+                    output_file='Aligned_PAFFT_nmr_spectra_byGroup.html',
+                    show_fig=False)
+
+#### Optional: Align by Chemical shift Regions
+region_alignments = [
+    {
+        'region': (-0.5, 6.5),
+        'align_func': dp.align_samples_using_icoshift,
+        'params': {'n_intervals': 550, 'target': 'maxcorr'}
+    },
+    {
+        'region': (6.5, 10),
+        'align_func': dp.PAFFT_df,  # Replace with another function if needed
+        'params': {'segSize_ppm': 0.1, 'reference_idx': 0, 'shift_ppm': 0.04}
+    }
+]
+
+final_aligned_df = dp.apply_alignment_by_regions(aligned_df, region_alignments)
+
+dp.create_nmr_plot(final_aligned_df, 
+                    x_axis_col='Chemical Shift (ppm)', 
+                    start_column=1, 
+                    end_column=None, 
+                    title='Aligned_PAFFT_NMR Spectra Overlapping',
+                    xaxis_title='Chemical Shift (ppm)',
+                    yaxis_title='Intensity',
+                    legend_title='Samples',
+                    output_dir='images', 
+                    output_file='Aligned_PAFFT_nmr_spectra_byCHemShift.html',
+                    show_fig=False)
+"""
+-
+
 ## Contributing
 
 Contributions are welcome! If you have suggestions, bug fixes, or improvements, please open an issue or submit a pull request. When contributing, please follow the repository’s coding guidelines and maintain clear documentation.
