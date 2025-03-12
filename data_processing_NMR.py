@@ -537,7 +537,99 @@ def export_metaboanalyst(aligned_df, df_metadata,
     return new_df
 
 # --------------------------------------------------------------------------
-#               6) CENTERING, NORMALIZATION & SCALING FUNCTIONS
+#               6) QUALITY CONTROL CHECK
+# --------------------------------------------------------------------------
+def calculate_peak_area(df, peak_intervals, x_axis='Chemical Shift (ppm)'):
+    """
+    Calculate the area under the curve for specified peak intervals for each sample.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame containing the spectral data. Must have a column with chemical shift values 
+        (e.g., 'Chemical Shift (ppm)') and the remaining columns are sample intensities.
+    peak_intervals : list of tuples
+        List of tuples, where each tuple defines the start and end of the peak interval (in ppm).
+        Example: [(7.79, 7.83), (7.5, 7.55)]
+    x_axis : str
+        Name of the column containing chemical shift values.
+    
+    Returns:
+    --------
+    areas_dict : dict
+        A dictionary where keys are string representations of the peak intervals and values are 
+        pandas Series with sample names as index and calculated areas as values.
+    """
+    areas_dict = {}
+    # Get the chemical shift vector
+    x = df[x_axis].values
+    
+    for (start, end) in peak_intervals:
+        # Create a boolean mask for the selected interval.
+        mask = (x >= start) & (x <= end)
+        area_values = {}
+        # For each sample column (skip the x-axis column)
+        for col in df.columns:
+            if col == x_axis:
+                continue
+            y = df[col].values
+            # Restrict both x and y to the interval
+            x_segment = x[mask]
+            y_segment = y[mask]
+            if len(x_segment) > 1:
+                # Use the trapezoidal rule to compute the area
+                area = np.trapz(y_segment, x_segment)
+            else:
+                area = np.nan
+            area_values[col] = area
+        areas_dict[f"[{start}, {end}]"] = pd.Series(area_values)
+    
+    return areas_dict
+
+def plot_peak_areas(areas_dict, output_dir="images"):
+    """
+    Plot scatter plots for each peak interval showing the area under the curve for each sample.
+    Overlays a red dashed line for the mean and a red shaded region for one standard deviation.
+    Each plot is saved in the specified output directory.
+    
+    Parameters:
+    -----------
+    areas_dict : dict
+        Dictionary with keys as peak interval strings and values as pandas Series with areas.
+    output_dir : str
+        Directory where the plots will be saved.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for region, series in areas_dict.items():
+        plt.figure(figsize=(10, 6))
+        x_positions = np.arange(len(series))
+        plt.scatter(x_positions, series.values, color='blue', s=50, label="Area")
+        
+        # Calculate mean and standard deviation
+        mean_val = series.mean()
+        std_val = series.std()
+        
+        # Plot mean line and standard deviation band
+        plt.axhline(mean_val, color='red', linestyle='--', label=f"Mean = {mean_val:.2f}")
+        plt.fill_between(x_positions, mean_val - std_val, mean_val + std_val, color='red', alpha=0.2, label=f"Std = {std_val:.2f}")
+        
+        plt.xticks(x_positions, series.index, rotation=90)
+        plt.xlabel("Sample")
+        plt.ylabel("Area Under Curve")
+        plt.title(f"Peak Area for {region} ppm")
+        plt.legend()
+        plt.tight_layout()
+        
+        # Save the figure to the output directory
+        filename = f"PeakArea_{region.replace('[', '').replace(']', '').replace(', ', '_')}.png"
+        plt.savefig(os.path.join(output_dir, filename), dpi=300)
+        plt.show()
+        plt.close()
+
+
+# --------------------------------------------------------------------------
+#               7) CENTERING, NORMALIZATION & SCALING FUNCTIONS
 # --------------------------------------------------------------------------
 # Centering Functions
 def log_transform(df, constant=1):
@@ -718,6 +810,41 @@ def auto_scale(df, exclude_columns=None):
                 df[column] = df[column] - df[column].mean()
     return df
 
+from sklearn.preprocessing import StandardScaler
+
+def auto_scale_m(df, exclude_columns=None):
+    """
+    Applies auto-scaling (mean-centering and division by std) to all columns except those excluded.
+    This replicates scikit-learn's StandardScaler approach, commonly used in MetaboAnalyst.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing numeric columns to be scaled.
+    exclude_columns : list or None
+        Columns that should not be scaled (e.g., "Chemical Shift (ppm)", "RT(min)").
+
+    Returns
+    -------
+    df_scaled : pd.DataFrame
+        A new DataFrame with scaled columns (except excluded ones).
+    """
+    df_scaled = df.copy()
+    if exclude_columns is None:
+        exclude_columns = ["RT(min)", "Chemical Shift (ppm)"]
+
+    # Identify columns to be scaled
+    scale_cols = [col for col in df_scaled.columns if col not in exclude_columns]
+
+    # Apply StandardScaler to those columns
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(df_scaled[scale_cols])
+
+    # Replace the original columns with scaled values
+    df_scaled[scale_cols] = scaled_data
+
+    return df_scaled
+
 def pareto_scale(df, exclude_columns=None):
     df = df.copy()
     if exclude_columns is None:
@@ -742,25 +869,31 @@ def range_scale(df, exclude_columns=None):
                 df[column] = (df[column] - df[column].mean()) / rng
     return df
 
-import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-def compare_normalization_plots(before_df, after_df, 
-                                sample_limit=50, 
-                                exclude_columns=None, 
-                                title_before='Before Normalization',
-                                title_after='After Normalization'):
+def compare_normalization_plots(
+    before_df, 
+    after_df, 
+    sample_limit=50, 
+    exclude_columns=None, 
+    title_before='Before Normalization',
+    title_after='After Normalization',
+    show_full_xrange=False,
+    zoom_in_std=None
+):
     """
     Creates a 2x2 grid of plots:
       - Top-left: Density plot of all values before normalization
-      - Top-right: Density plot of all values after normalization
+      - Top-right: Density plot of all values after normalization 
+                   (range controlled by show_full_xrange or zoom_in_std).
       - Bottom-left: Box plot (at most sample_limit columns) before normalization
       - Bottom-right: Box plot (at most sample_limit columns) after normalization
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     before_df : pd.DataFrame
         DataFrame containing the data prior to normalization.
     after_df : pd.DataFrame
@@ -773,12 +906,18 @@ def compare_normalization_plots(before_df, after_df,
         Title for the "before" plots.
     title_after : str
         Title for the "after" plots.
+    show_full_xrange : bool
+        If True, the top-right density plot will show the entire range of values.
+        If False, it will restrict the view to the 1st and 99th percentiles (unless zoom_in_std is used).
+    zoom_in_std : float or None
+        If not None, the top-right density plot will show mean ± (zoom_in_std * standard deviation).
+        This overrides the percentile-based or full-range display.
     """
     # Copy DataFrames so we don't modify the originals
     df_before = before_df.copy()
     df_after = after_df.copy()
     
-    # Exclude certain columns if requested (e.g. "Chemical Shift (ppm)", "RT(min)", etc.)
+    # Exclude certain columns if requested
     if exclude_columns is not None:
         df_before.drop(columns=exclude_columns, errors='ignore', inplace=True)
         df_after.drop(columns=exclude_columns, errors='ignore', inplace=True)
@@ -786,6 +925,12 @@ def compare_normalization_plots(before_df, after_df,
     # Flatten the entire DataFrame values for density plots
     all_values_before = df_before.values.flatten()
     all_values_after = df_after.values.flatten()
+    
+    # Calculate some statistics for controlling the x-axis range
+    lower_limit = np.percentile(all_values_after, 1)
+    upper_limit = np.percentile(all_values_after, 99)
+    mean_val = np.mean(all_values_after)
+    std_val = np.std(all_values_after)
 
     # Limit columns for box plot (for readability)
     limited_cols_before = df_before.columns[:sample_limit]
@@ -800,19 +945,30 @@ def compare_normalization_plots(before_df, after_df,
     axes[0,0].set_title(title_before, fontsize=12)
     axes[0,0].set_xlabel("Value")
     axes[0,0].set_ylabel("Density")
-
+    
     # --- Top-right: Density of all values AFTER normalization ---
     sns.kdeplot(x=all_values_after, ax=axes[0,1], color='darkorange', fill=True)
     axes[0,1].set_title(title_after, fontsize=12)
     axes[0,1].set_xlabel("Value")
     axes[0,1].set_ylabel("Density")
+    
+    # Control the x-axis range for the "after" density plot
+    if zoom_in_std is not None:
+        # Show mean ± zoom_in_std * std_val
+        axes[0,1].set_xlim(mean_val - zoom_in_std * std_val, 
+                           mean_val + zoom_in_std * std_val)
+    else:
+        # If zoom_in_std is not used, check if we should show full range or restrict to 1st-99th percentiles
+        if not show_full_xrange:
+            axes[0,1].set_xlim(lower_limit, upper_limit)
+        # else: do nothing => show the full range automatically
 
     # --- Bottom-left: Box plot BEFORE normalization ---
     sns.boxplot(data=df_before[limited_cols_before], ax=axes[1,0], color='steelblue')
     axes[1,0].tick_params(axis='x', rotation=90)
     axes[1,0].set_title(title_before, fontsize=12)
     axes[1,0].set_ylabel("Value")
-
+    
     # --- Bottom-right: Box plot AFTER normalization ---
     sns.boxplot(data=df_after[limited_cols_after], ax=axes[1,1], color='darkorange')
     axes[1,1].tick_params(axis='x', rotation=90)
@@ -823,46 +979,184 @@ def compare_normalization_plots(before_df, after_df,
     plt.show()
 
 
+
 # --------------------------------------------------------------------------
-#               7) PCA & PLS-DA, VIP FUNCTIONS
+#               8) PCA & PLS-DA, VIP FUNCTIONS
 # --------------------------------------------------------------------------
+import os
+import numpy as np
+import pandas as pd
+import plotly.express as px
+from types import SimpleNamespace  # Import for converting dict to object
+
+def nipals_pca(X, n_components, thresh=1e-15):
+    """
+    Perform PCA using the iterative NIPALS algorithm.
+    
+    Parameters:
+        X : np.ndarray
+            Data matrix with shape (n_samples, n_features).
+        n_components : int
+            Number of principal components to compute.
+        thresh : float, optional
+            Convergence threshold for the iterative algorithm.
+    
+    Returns:
+        T : np.ndarray
+            Scores matrix with shape (n_samples, n_components).
+        P : np.ndarray
+            Loadings matrix with shape (n_components, n_features).
+        variance : np.ndarray
+            Explained variance (as fraction of total variance) for each component.
+    """
+    n_samples, n_features = X.shape
+    T = np.zeros((n_samples, n_components))  # scores
+    P = np.zeros((n_features, n_components)) # loadings (each column is a loading vector)
+    variance = np.zeros(n_components)        # variance explained by each component
+    
+    Xi = X.copy()  # working copy of X
+    total_variance = np.sum(X ** 2)
+    
+    for i in range(n_components):
+        residual = 1.0
+        p_initial = np.zeros(n_features)
+        # Initialize t as the first column of Xi.
+        t = Xi[:, 0].copy()
+        
+        while residual > thresh:
+            # Compute loading: project Xi onto t.
+            p = np.dot(Xi.T, t) / np.dot(t, t)
+            # Normalize p to have unit length.
+            norm_p = np.sqrt(np.dot(p, p))
+            if norm_p != 0:
+                p = p / norm_p
+            # Recalculate score: project Xi onto p.
+            t = np.dot(Xi, p) / np.dot(p, p)
+            # Check convergence based on change in loadings.
+            E = p_initial - p
+            residual = np.dot(E, E)
+            p_initial = p.copy()
+        
+        T[:, i] = t
+        P[:, i] = p
+        # Remove the contribution of the extracted component.
+        Xi = Xi - np.outer(t, p)
+        # Calculate the proportion of variance explained by this component.
+        variance[i] = np.sum((np.outer(t, p))**2) / total_variance
+    
+    # Transpose loadings so that each row corresponds to a component.
+    return T, P.T, variance
+
 def perform_pca_analysis(data, pc_x=1, pc_y=2, n_components=None, variance_threshold=90,
-                         metadata=None, color_column="ATTRIBUTE_group", sample_id_col="ATTRIBUTE_localsampleid",
-                         output_dir='images', score_plot_filename=None, ev_plot_filename=None,
-                         show_fig=True):
-    if (score_plot_filename is not None) or (ev_plot_filename is not None):
-        os.makedirs(output_dir, exist_ok=True)
-    X = data.transpose()
+                          metadata=None, color_column="ATTRIBUTE_group", sample_id_col="NMR_filename",
+                          output_dir='images', score_plot_filename=None, ev_plot_filename=None,
+                          show_fig=True):
+    """
+    Performs PCA using an iterative NIPALS algorithm.
+    The function computes PCA scores, loadings, explained variance, and creates interactive plots.
+    
+    Parameters:
+        data : pd.DataFrame or np.ndarray
+            Data with features as rows and samples as columns. The function transposes it so that
+            each row represents a sample.
+        pc_x, pc_y : int
+            Principal components to plot on the x and y axes.
+        n_components : int, optional
+            Number of principal components to compute. If None, the number is determined based on
+            the variance_threshold.
+        variance_threshold : float, optional
+            Minimum cumulative explained variance (in %) to determine the number of components.
+        metadata : pd.DataFrame, optional
+            Metadata to merge with the PCA scores DataFrame.
+        color_column : str
+            Column in metadata used for coloring the score plot.
+        sample_id_col : str
+            Column name for sample IDs in the metadata.
+        output_dir : str
+            Directory to save plot HTML files.
+        score_plot_filename, ev_plot_filename : str, optional
+            Filenames for saving the score and explained variance plots.
+        show_fig : bool
+            Whether to display the plots.
+    
+    Returns:
+        tuple: (pca_model, scores_df, explained_variance) where:
+            - pca_model is an object with attributes 'scores', 'loadings', 'variance', and 'components_'.
+            - scores_df is a DataFrame with PCA scores (and merged metadata if provided).
+            - explained_variance is an array with percentage explained variance per component.
+    """
+    # If data is a DataFrame, drop the "Chemical Shift (ppm)" column if it exists.
+    if isinstance(data, pd.DataFrame):
+        if "Chemical Shift (ppm)" in data.columns:
+            data = data.drop(columns=["Chemical Shift (ppm)"])
+
+    # Transpose data so that rows represent samples.
+    if isinstance(data, pd.DataFrame):
+        X = data.transpose().values
+        sample_ids = data.transpose().index
+    else:
+        X = data.T
+        sample_ids = np.arange(X.shape[0])
+    
+    # *** Center the data to mimic MATLAB's PCA centering ***
+    mu = np.mean(X, axis=0)
+    X = X - mu
+
+    # Determine the maximum possible number of components.
     max_comp = min(X.shape)
-    pca_full = PCA(n_components=max_comp)
-    pca_full.fit(X)
-    cum_var = np.cumsum(pca_full.explained_variance_ratio_) * 100
+    
+    # First, run NIPALS for the maximum number of components to calculate cumulative variance.
+    T_full, P_full, var_full = nipals_pca(X, n_components=max_comp)
+    cum_var = np.cumsum(var_full) * 100  # cumulative explained variance in %
+    
+    # Determine the number of components needed to reach the variance threshold.
     n_comp = np.argmax(cum_var >= variance_threshold) + 1
+    # Ensure at least the plotted components are computed.
     n_comp = max(n_comp, pc_x, pc_y)
+    
+    # Override if user provided a fixed n_components.
     if n_components is not None:
         n_comp = n_components
-    pca_model = PCA(n_components=n_comp)
-    principal_components = pca_model.fit_transform(X)
+    
+    # Run NIPALS again with the desired number of components.
+    scores, loadings, variance = nipals_pca(X, n_components=n_comp)
     comp_labels = [f"PC{i+1}" for i in range(n_comp)]
-    scores_df = pd.DataFrame(principal_components, columns=comp_labels, index=X.index)
+    
+    # Create a DataFrame for PCA scores.
+    scores_df = pd.DataFrame(scores, columns=comp_labels, index=sample_ids)
+    
+    # Merge with metadata if provided.
     if metadata is not None:
         scores_df = scores_df.merge(metadata[[sample_id_col, color_column]],
                                     left_index=True, right_on=sample_id_col, how='left')
+    
+    # Convert explained variance fractions to percentages.
+    explained_variance = np.array(variance) * 100
+    
+    # Create axis labels that include the explained variance.
+    xlabel = f"PC{pc_x} ({explained_variance[pc_x-1]:.1f}% explained variance)"
+    ylabel = f"PC{pc_y} ({explained_variance[pc_y-1]:.1f}% explained variance)"
+    
+    # Create the PCA score scatter plot.
     fig_scores = px.scatter(
         scores_df, 
         x=f"PC{pc_x}", 
         y=f"PC{pc_y}",
         color=color_column if metadata is not None else None,
         title="PCA Score Plot",
-        labels={f"PC{pc_x}": f"Principal Component {pc_x}", 
-                f"PC{pc_y}": f"Principal Component {pc_y}"}
+        labels={
+            f"PC{pc_x}": xlabel,
+            f"PC{pc_y}": ylabel
+        }
     )
     if score_plot_filename is not None:
+        os.makedirs(output_dir, exist_ok=True)
         score_plot_file = os.path.join(output_dir, score_plot_filename)
         fig_scores.write_html(score_plot_file)
     if show_fig:
         fig_scores.show()
-    explained_variance = pca_model.explained_variance_ratio_ * 100
+    
+    # Create explained variance bar plot.
     ev_df = pd.DataFrame({
         "Component": comp_labels, 
         "Explained Variance (%)": explained_variance
@@ -876,14 +1170,44 @@ def perform_pca_analysis(data, pc_x=1, pc_y=2, n_components=None, variance_thres
     )
     fig_ev.update_traces(textposition='outside')
     if ev_plot_filename is not None:
+        os.makedirs(output_dir, exist_ok=True)
         ev_plot_file = os.path.join(output_dir, ev_plot_filename)
         fig_ev.write_html(ev_plot_file)
     if show_fig:
         fig_ev.show()
+    
+    # Package the NIPALS results in a dictionary as the PCA model.
+    model_dict = {
+        "scores": scores,
+        "loadings": loadings,
+        "variance": variance,
+        "components_": loadings
+    }
+    
+    # Convert the dictionary to an object with attribute access.
+    pca_model = SimpleNamespace(**model_dict)
+    
     return pca_model, scores_df, explained_variance
+
 
 def plot_pca_loadings(data, pca_model, PC_choose=1, x_axis_col='Chemical Shift (ppm)', 
                       output_dir='images', output_file=None, save_fig=True, show_fig=True):
+    """
+    Plots the PCA loadings for a selected principal component.
+    
+    Parameters:
+        data (DataFrame): Input data containing the x-axis values.
+        pca_model (PCA object): Fitted PCA model with computed components.
+        PC_choose (int): The principal component to plot (1-indexed).
+        x_axis_col (str): Column in data for x-axis values.
+        output_dir (str): Directory to save the plot.
+        output_file (str): Filename for saving the plot.
+        save_fig (bool): Whether to save the plot as an HTML file.
+        show_fig (bool): Whether to display the plot.
+    
+    Returns:
+        Plotly Figure object.
+    """
     if output_file is None:
         output_file = f'PCA_PC{PC_choose}_Loadings.html'
     fig = go.Figure()
@@ -947,7 +1271,7 @@ def perform_pls_da(
     ----------
     data : pd.DataFrame
         Normalized feature matrix with columns as samples (and rows as features).
-        (Does NOT include the chemical shift axis.)
+        (If the chemical shift axis is included as a row or column, it will be ignored.)
     metadata : pd.DataFrame
         DataFrame containing sample metadata. Must include the sample_id_col (matching data columns)
         and a grouping column (group_col) for classification.
@@ -971,42 +1295,48 @@ def perform_pls_da(
     scores_df : pd.DataFrame
         DataFrame containing the latent variable scores for each sample, merged with group labels.
     """
-
+    # If data is a DataFrame, remove any row or column named "Chemical Shift (ppm)".
+    if isinstance(data, pd.DataFrame):
+        if "Chemical Shift (ppm)" in data.columns:
+            data = data.drop(columns=["Chemical Shift (ppm)"])
+        if "Chemical Shift (ppm)" in data.index:
+            data = data.drop(index=["Chemical Shift (ppm)"])
+    
     # Ensure output directory exists if we plan to save
     if score_plot_filename is not None:
         os.makedirs(output_dir, exist_ok=True)
     
     # 1. Transpose data so rows = samples, columns = features
     X = data.transpose()  # shape = [n_samples, n_features]
-
+    
     # 2. Align the metadata so that it matches the rows of X
     sample_index_df = pd.DataFrame({sample_id_col: X.index})
     merged_df = sample_index_df.merge(metadata, on=sample_id_col, how='left')
-
+    
     # 3. One-hot encode the group labels for PLS-DA
     groups = merged_df[group_col].astype(str).values.reshape(-1, 1)
     encoder = OneHotEncoder(sparse_output=False)
     Y = encoder.fit_transform(groups)  # shape = [n_samples, n_classes]
-
+    
     # 4. Fit the PLS regression model
     pls_model = PLSRegression(n_components=n_components)
     pls_model.fit(X, Y)
-
+    
     # 5. Extract x-scores (latent variable scores for each sample)
     x_scores = pls_model.x_scores_
     lv_cols = [f"LV{i+1}" for i in range(n_components)]
     scores_df = pd.DataFrame(x_scores, columns=lv_cols, index=X.index)
-
+    
     # (A) Reset index and rename so sample IDs become a column named sample_id_col
     scores_df = scores_df.reset_index().rename(columns={"index": sample_id_col})
-
-    # (B) Merge on the sample_id_col
+    
+    # (B) Merge on the sample_id_col to get group labels
     scores_df = scores_df.merge(
         merged_df[[sample_id_col, group_col]],
         on=sample_id_col,
         how='left'
     )
-
+    
     # 6. Plot the first two latent variables in an interactive scatter plot
     if n_components >= 2:
         fig = px.scatter(
@@ -1025,7 +1355,7 @@ def perform_pls_da(
             fig.show()
     else:
         print(f"n_components={n_components} < 2, so no 2D score plot was generated.")
-
+    
     return pls_model, scores_df
 
 
@@ -1121,16 +1451,15 @@ def calculate_vip(pls_model):
     vip : np.array of shape (n_predictors,)
         VIP scores for each predictor.
     """
-    t = pls_model.x_scores_  # latent scores, shape (n_samples, n_components)
-    w = pls_model.x_weights_ # weights, shape (n_predictors, n_components)
-    q = pls_model.y_loadings_  # y loadings, shape (n_components, 1) for single response
-    A = w.shape[1]
-    p = w.shape[0]
-    
-    # Calculate the explained sum of squares for each component.
+def calculate_vip(pls_model):
+    t = pls_model.x_scores_          # shape: (n_samples, n_components)
+    q = pls_model.y_loadings_          # shape: (n_components, n_responses)
+    A = t.shape[1]                    # Actual number of components
     ssy = np.zeros(A)
+    
     for a in range(A):
         ssy[a] = np.sum(t[:, a]**2) * (q[a, 0] ** 2)
+    
     total_ssy = np.sum(ssy)
     
     vip = np.zeros(p)
@@ -1142,7 +1471,7 @@ def calculate_vip(pls_model):
         vip[j] = np.sqrt(p * sum_term / total_ssy)
     return vip
 
-def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0, 
+def plot_pls_loadings(pls_model, chemical_shift, comp=1, vip_threshold=1.0, 
                       output_filename=None, show_fig=True, figure_size=(10, 6)):
     """
     Plot the loadings for a chosen component from a fitted PLS-DA model against the chemical shift axis.
@@ -1159,8 +1488,8 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
         The PLS-DA model from which to extract loadings.
     chemical_shift : array-like, shape (n_predictors,)
         The chemical shift values corresponding to the predictors (should be in the same order as the predictors).
-    comp : int, optional (default=0)
-        The component index to plot (0 corresponds to the first component).
+    comp : int, optional (default=1)
+        The component number to plot (1 corresponds to the first component).
     vip_threshold : float, optional (default=1.0)
         The VIP threshold. Predictors with VIP >= vip_threshold will be highlighted.
     output_filename : str or None, optional (default=None)
@@ -1174,8 +1503,11 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
     -------
     None
     """
+    # Convert 1-indexed comp to 0-indexed for array access.
+    comp_index = comp - 1
+    
     # Get the loadings for the selected component
-    loadings = pls_model.x_loadings_[:, comp]  # shape (n_predictors,)
+    loadings = pls_model.x_loadings_[:, comp_index]  # shape (n_predictors,)
     
     # Calculate VIP scores for all predictors
     vip = calculate_vip(pls_model)
@@ -1194,12 +1526,11 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
         else:
             color = 'gray'
             marker_size = 4
-        # Here, we use a square marker; you can change marker style if desired.
         plt.plot(chemical_shift[j], loadings[j], marker='s', color=color, markersize=marker_size, markeredgecolor='k')
     
     plt.xlabel('Chemical Shift (ppm)')
-    plt.ylabel(f'Loadings (Component {comp+1})')
-    plt.title(f'PLS-DA Loadings (Component {comp+1})\nVIP Threshold = {vip_threshold}')
+    plt.ylabel(f'Loadings (Component {comp})')
+    plt.title(f'PLS-DA Loadings (Component {comp})\nVIP Threshold = {vip_threshold}')
     
     # Create a legend manually
     from matplotlib.lines import Line2D
@@ -1209,7 +1540,7 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
         Line2D([0], [0], marker='s', color='w', label=f'VIP ≥ {vip_threshold} (negative)', 
                markerfacecolor='blue', markersize=8, markeredgecolor='k'),
         Line2D([0], [0], marker='s', color='w', label=f'VIP < {vip_threshold}', 
-               markerfacecolor='gray', markersize=1, markeredgecolor='k'),
+               markerfacecolor='gray', markersize=4, markeredgecolor='k'),
         Line2D([0], [0], color='k', lw=1.5, label='Loadings Trace')
     ]
     plt.legend(handles=legend_elements)
@@ -1226,6 +1557,109 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
     else:
         plt.close()
 
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+def plot_pls_loadings2(pls_model, chemical_shift, comp=1, vip_threshold=1.0, 
+                      output_filename=None, show_fig=True, figure_size=(10, 6)):
+    """
+    Plot the loadings for a chosen component from a fitted PLS-DA model against the chemical shift axis.
+    
+    The loadings are plotted as a continuous trace (line) and overlaid with markers that are color-coded 
+    based on their VIP scores:
+      - Markers in red for VIP >= vip_threshold and positive loading.
+      - Markers in blue for VIP >= vip_threshold and negative loading.
+      - Markers in gray for VIP < vip_threshold.
+    
+    Parameters
+    ----------
+    pls_model : fitted PLSRegression model
+        The PLS-DA model from which to extract loadings.
+    chemical_shift : array-like, shape (n_predictors,)
+        The chemical shift values corresponding to the predictors (should be in the same order as the predictors).
+    comp : int, optional (default=1)
+        The component number to plot (1 corresponds to the first component). Must be >= 1.
+    vip_threshold : float, optional (default=1.0)
+        The VIP threshold. Predictors with VIP >= vip_threshold will be highlighted.
+    output_filename : str or None, optional (default=None)
+        If provided, the plot is saved to this file.
+    show_fig : bool, optional (default=True)
+        If True, display the plot interactively.
+    figure_size : tuple, optional (default=(10,6))
+        Figure size.
+    
+    Returns
+    -------
+    None
+    """
+    # Ensure comp is at least 1
+    if comp < 1:
+        print("Warning: Component number must be >= 1. Using Component 1 instead.")
+        comp = 1
+    # Convert to 0-indexed for array access.
+    comp_index = comp - 1
+
+    # Get the loadings for the selected component from a PLS model.
+    # For a PLSRegression, the x_loadings_ attribute holds the loadings.
+    loadings = pls_model.x_loadings_  # shape (n_predictors, n_components)
+    if comp_index >= loadings.shape[1]:
+        raise IndexError(f"Component {comp} is out of bounds. The model only has {loadings.shape[1]} components.")
+    selected_loadings = loadings[:, comp_index]  # shape (n_predictors,)
+
+    # Calculate VIP scores for all predictors.
+    # Note: calculate_vip should be defined elsewhere.
+    vip = calculate_vip(pls_model)
+    
+    plt.figure(figsize=figure_size)
+    
+    # Plot the continuous trace (line) for loadings.
+    plt.plot(chemical_shift, selected_loadings, '-k', linewidth=1.5, label='Loadings Trace')
+    
+    # Overlay markers at each chemical shift.
+    for j in range(len(selected_loadings)):
+        # Choose marker color based on VIP and sign of loading.
+        if vip[j] >= vip_threshold:
+            color = 'red' if selected_loadings[j] >= 0 else 'blue'
+            marker_size = 8
+        else:
+            color = 'gray'
+            marker_size = 4
+        plt.plot(chemical_shift[j], selected_loadings[j], marker='s', color=color, 
+                 markersize=marker_size, markeredgecolor='k')
+    
+    plt.xlabel('Chemical Shift (ppm)')
+    plt.ylabel(f'Loadings (Component {comp})')
+    plt.title(f'PLS-DA Loadings (Component {comp})\nVIP Threshold = {vip_threshold}')
+    
+    # Create a legend manually.
+    legend_elements = [
+        Line2D([0], [0], marker='s', color='w', label=f'VIP ≥ {vip_threshold} (positive)', 
+               markerfacecolor='red', markersize=8, markeredgecolor='k'),
+        Line2D([0], [0], marker='s', color='w', label=f'VIP ≥ {vip_threshold} (negative)', 
+               markerfacecolor='blue', markersize=8, markeredgecolor='k'),
+        Line2D([0], [0], marker='s', color='w', label=f'VIP < {vip_threshold}', 
+               markerfacecolor='gray', markersize=4, markeredgecolor='k'),
+        Line2D([0], [0], color='k', lw=1.5, label='Loadings Trace')
+    ]
+    plt.legend(handles=legend_elements)
+    
+    # Typically, chemical shift axes are plotted in reverse (high ppm to low ppm)
+    plt.gca().invert_xaxis()
+    
+    if output_filename is not None:
+        output_path = os.path.join("images", output_filename)
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Loadings plot saved as: {output_path}")
+    if show_fig:
+        plt.show()
+    else:
+        plt.close()
+
+        
+        
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1378,6 +1812,11 @@ def calculate_vip(pls_model):
         vip[j] = np.sqrt(p * sum_term / total_ssy)
     return vip
 
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
 def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0, 
                       output_filename=None, show_fig=True, figure_size=(10, 6)):
     """
@@ -1399,7 +1838,7 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
     vip_threshold : float, optional (default=1.0)
         The VIP threshold. Predictors with VIP >= vip_threshold will be highlighted.
     output_filename : str or None, optional (default=None)
-        If provided, the plot is saved to this file.
+        If provided, the plot is saved to this file inside the folder "images".
     show_fig : bool, optional (default=True)
         If True, display the plot interactively.
     figure_size : tuple, optional (default=(10,6))
@@ -1412,7 +1851,7 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
     # Get the loadings for the selected component
     loadings = pls_model.x_loadings_[:, comp]  # shape (n_predictors,)
     
-    # Calculate VIP scores for all predictors
+    # Calculate VIP scores for all predictors (assuming you have a calculate_vip function)
     vip = calculate_vip(pls_model)
     
     # Determine colors: if VIP >= threshold, use red for positive loadings, blue for negative; otherwise gray.
@@ -1429,27 +1868,33 @@ def plot_pls_loadings(pls_model, chemical_shift, comp=0, vip_threshold=1.0,
     plt.ylabel(f'Loadings (Component {comp+1})')
     plt.title(f'PLS-DA Loadings (Component {comp+1})\nVIP Threshold = {vip_threshold}')
     
-    # Create a legend manually
-    from matplotlib.lines import Line2D
+    # Create a legend manually.
     legend_elements = [
         Line2D([0], [0], marker='o', color='w', label=f'VIP ≥ {vip_threshold} (positive)', 
-               markerfacecolor='red', markersize=4, markeredgecolor='k'),
+               markerfacecolor='red', markersize=6, markeredgecolor='k'),
         Line2D([0], [0], marker='o', color='w', label=f'VIP ≥ {vip_threshold} (negative)', 
-               markerfacecolor='blue', markersize=4, markeredgecolor='k'),
+               markerfacecolor='blue', markersize=6, markeredgecolor='k'),
         Line2D([0], [0], marker='o', color='w', label=f'VIP < {vip_threshold}', 
-               markerfacecolor='gray', markersize=1, markeredgecolor='k')
+               markerfacecolor='gray', markersize=4, markeredgecolor='k')
     ]
     plt.legend(handles=legend_elements)
+    
     # Typically, chemical shift axes are plotted in reverse (high ppm to low ppm)
     plt.gca().invert_xaxis()
     
+    # Save the figure inside the "images" folder if output_filename is provided.
     if output_filename is not None:
-        plt.savefig(output_filename, dpi=300, bbox_inches='tight')
-        print(f"Loadings plot saved as: {output_filename}")
+        folder = "images"
+        os.makedirs(folder, exist_ok=True)
+        file_path = os.path.join(folder, output_filename)
+        plt.savefig(file_path, dpi=300, bbox_inches='tight')
+        print(f"Loadings plot saved as: {file_path}")
+        
     if show_fig:
         plt.show()
     else:
         plt.close()
+
 
 import os
 import plotly.graph_objects as go
@@ -1666,7 +2111,7 @@ def perform_opls_da(
     ----------
     data : pd.DataFrame
         Normalized feature matrix with columns as samples (rows as features).
-        (Does NOT include the chemical shift axis.)
+        (If the chemical shift axis is included as a column or row, it will be ignored.)
     metadata : pd.DataFrame
         DataFrame containing sample metadata. Must include the sample_id_col (matching data columns)
         and a grouping column (group_col) for classification.
@@ -1692,6 +2137,13 @@ def perform_opls_da(
           - "pca_ortho": the PCA model fitted on the residual (orthogonal components) (or None if n_components==1).
           - "scores_df": DataFrame of latent variable scores (predictive and orthogonal) merged with metadata.
     """
+    # If data is a DataFrame, remove any column or row named "Chemical Shift (ppm)"
+    if isinstance(data, pd.DataFrame):
+        if "Chemical Shift (ppm)" in data.columns:
+            data = data.drop(columns=["Chemical Shift (ppm)"])
+        if "Chemical Shift (ppm)" in data.index:
+            data = data.drop(index=["Chemical Shift (ppm)"])
+    
     # Ensure output directory exists if saving the plot.
     if score_plot_filename is not None:
         os.makedirs(output_dir, exist_ok=True)
@@ -1717,7 +2169,7 @@ def perform_opls_da(
     # --- Step 2: Remove predictive variation to compute orthogonal variation ---
     # Reconstruct X from the predictive component.
     X_pred = t_pred.dot(p_pred.T)
-    # Residual matrix (X_orth) contains the orthogonal variation.
+    # Residual matrix (X_res) contains the orthogonal variation.
     X_res = X - X_pred
 
     # --- Step 3: Extract orthogonal component(s) from the residual using PCA ---
@@ -1735,7 +2187,11 @@ def perform_opls_da(
     lv_names = ['Predictive'] + [f"Orthogonal{i+1}" for i in range(n_ortho)]
     scores_df = pd.DataFrame(scores, columns=lv_names, index=X.index)
     scores_df = scores_df.reset_index().rename(columns={"index": sample_id_col})
-    scores_df = scores_df.merge(merged_df[[sample_id_col, group_col]], on=sample_id_col, how='left')
+    scores_df = scores_df.merge(
+        merged_df[[sample_id_col, group_col]],
+        on=sample_id_col,
+        how='left'
+    )
     
     # --- Step 5: Plot the score plot (Predictive vs. first Orthogonal) ---
     if n_components >= 2:
@@ -1758,6 +2214,7 @@ def perform_opls_da(
     
     model_dict = {"pls_model": pls_model, "pca_ortho": pca_ortho, "scores_df": scores_df}
     return model_dict
+
 
 def plot_oplsda_predictive_loadings(data, model_dict, x_axis_col='RT(min)', 
                                     output_dir='images', output_file=None, 
@@ -1799,7 +2256,8 @@ def plot_oplsda_predictive_loadings(data, model_dict, x_axis_col='RT(min)',
     fig.update_layout(
         title='OPLS-DA Predictive Loading Plot',
         xaxis_title=x_axis_col,
-        yaxis_title='Loading Value'
+        yaxis_title='Loading Value',
+        xaxis=dict(autorange='reversed')
     )
     if save_fig:
         if output_file is None:
@@ -1861,7 +2319,8 @@ def plot_oplsda_orthogonal_loadings(data, model_dict, component=1, x_axis_col='R
     fig.update_layout(
         title=f'OPLS-DA Orthogonal Component {component} Loading Plot',
         xaxis_title=x_axis_col,
-        yaxis_title='Loading Value'
+        yaxis_title='Loading Value',
+        xaxis=dict(autorange='reversed')
     )
     if save_fig:
         if output_file is None:
@@ -2049,10 +2508,8 @@ def plot_hca_heatmap(
     
     return fig
 
-
-
 # --------------------------------------------------------------------------
-#               8) STOCSY FUNCTIONS
+#               9) STOCSY FUNCTIONS
 # --------------------------------------------------------------------------
 def STOCSY(target, X, ppm):
     import mpld3
@@ -2179,7 +2636,7 @@ def STOCSY_interactive(target, X, ppm):
     return corr, covar
 
 # --------------------------------------------------------------------------
-#                    13) Data-Export
+#                    10) Data-Export
 # --------------------------------------------------------------------------
 
 import os
@@ -2281,7 +2738,7 @@ def export_metaboanalyst(aligned_df, df_metadata,
 
 
 # --------------------------------------------------------------------------
-#                    14) Data-Processing Report
+#                    11) Data-Processing Report
 # --------------------------------------------------------------------------
 def print_data_processing_report(start_rt, end_rt, samples_to_remove,
                                  aligned_method, normalization_method,
