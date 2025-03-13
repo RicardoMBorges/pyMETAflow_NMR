@@ -203,6 +203,18 @@ plt.legend(title="Group")
 plt.show()
 ```
 
+## Organizational Structure
+    pyMETAflow/
+        ├── data_processing_HPLC.py     # Main processing script
+        ├── README.md                   # This file
+        ├── requirements.txt            # Python package dependencies
+        ├── run.bat                     # .bat file for installation
+        └── project_folder/             # Each project should have its place
+            └── pyMETAflow_LC_UV.ipynb	# Each project should have its Jupyter Notebook to avoid confusion
+            └── Metadata.csv			# Metadata with: Samples, LC_filename, NMR_filename, ATTRIBUTE_classification, etc.
+			└── data.csv				# The .csv data as exported by MNova using File-SaveAS-.csv 
+			
+
 ## Contributing
 
 Contributions are welcome! If you have suggestions, bug fixes, or improvements, please open an issue or submit a pull request. When contributing, please follow the repository’s coding guidelines and maintain clear documentation.
