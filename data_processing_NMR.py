@@ -102,10 +102,36 @@ def combine_and_trim_data_NMRMNova(input_folder, output_folder, retention_time_s
 #               2) FILTERING & MASKING FUNCTIONS
 # --------------------------------------------------------------------------
 def filter_chemical_shift(data, start_limit=0.5, end_limit=10):
+    """
+    Filters the DataFrame to keep only rows where the values in the axis column are between start_limit and end_limit.
+
+    Parameters:
+        data (pd.DataFrame): The input DataFrame.
+        start_limit (float): The lower bound of the Chemical Shift range.
+        end_limit (float): The upper bound of the Chemical Shift range.
+        axis_column (str, optional): The column name representing the Chemical Shift axis.
+                                     If None, the function uses the first column.
+    
+    Returns:
+        pd.DataFrame: The filtered DataFrame.
+    """
     filtered_data = data[(data["Chemical Shift (ppm)"] >= start_limit) & (data["Chemical Shift (ppm)"] <= end_limit)]
     return filtered_data
 
 def mask_regions_with_zeros(data, regions):
+    """
+    Sets values to zero for all rows where the value in the axis column is between region_start and region_end.
+    
+    Parameters:
+        data (pd.DataFrame): The input DataFrame.
+        region_start (float): The starting value of the region.
+        region_end (float): The ending value of the region.
+        axis_column (str, optional): The column name representing the axis (e.g., retention time).
+                                     If None, the function uses the first column of the DataFrame.
+    
+    Returns:
+        pd.DataFrame: A modified DataFrame with values in the specified region set to zero (for all columns except the axis).
+    """
     modified_data = data.copy()
     for start, end in regions:
         mask = (modified_data["Chemical Shift (ppm)"] >= start) & (modified_data["Chemical Shift (ppm)"] <= end)
@@ -181,7 +207,8 @@ def create_vertical_multiplot(dataframes, titles,
         xaxis_title=xaxis_title,
         legend_title=legend_title,
         height=500 * n,
-        margin=dict(t=100)
+        margin=dict(t=100),
+        xaxis=dict(autorange='reversed')
     )
     os.makedirs(output_dir, exist_ok=True)
     fig.write_html(os.path.join(output_dir, output_file))
@@ -683,7 +710,7 @@ def normalize_by_control(df, control_column, exclude_columns=None):
     exclude_columns = exclude_columns if exclude_columns else []
     control = df[control_column]
     for column in df.columns:
-        if column != control_column and column not in exclude_columns and column != 'RT(min)':
+        if column != control_column and column not in exclude_columns and column != 'Chemical Shift (ppm)':
             df[column] = df[column] / control
     return df
 
@@ -1985,7 +2012,7 @@ def perform_hca(
     data,
     metadata,
     group_col="ATTRIBUTE_group",
-    sample_id_col="ATTRIBUTE_localsampleid",
+    sample_id_col="NMR_filename",
     method="ward",
     metric="euclidean",
     n_clusters=None,
@@ -2094,7 +2121,7 @@ def perform_opls_da(
     data,
     metadata,
     group_col="ATTRIBUTE_group",
-    sample_id_col="ATTRIBUTE_localsampleid",
+    sample_id_col="NMR_filename",
     n_components=2,
     output_dir="images",
     score_plot_filename=None,
@@ -2216,7 +2243,7 @@ def perform_opls_da(
     return model_dict
 
 
-def plot_oplsda_predictive_loadings(data, model_dict, x_axis_col='RT(min)', 
+def plot_oplsda_predictive_loadings(data, model_dict, x_axis_col='Chemical Shift (ppm)', 
                                     output_dir='images', output_file=None, 
                                     save_fig=True, show_fig=True):
     """
@@ -2432,7 +2459,7 @@ def analyze_opls_vip_scores(model_dict, X, top_n=10,
 def plot_hca_heatmap(
     data,
     metadata,
-    sample_id_col="ATTRIBUTE_localsampleid",
+    sample_id_col="NMR_filename",
     group_col="ATTRIBUTE_group",
     output_dir="images",
     heatmap_filename=None,
@@ -2818,6 +2845,7 @@ def STOCSY_mode(target, X, rt_values, mode="linear"):
 
     plt.show()
     return corr, covar
+
 
 
 # --------------------------------------------------------------------------
