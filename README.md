@@ -1,6 +1,10 @@
 # pyMetaboFlow_NMR
 This provides a comprehensive toolkit for NMR/metabolomics data processing and analysis. It includes modules for data extraction from MNova exports, spectral filtering and masking, referencing and alignment, data transformation, normalization, scaling, and advanced multivariate analyses. The processed data can also be exported to MetaboAnalyst.
 
+Tutorial:
+* Português: https://youtu.be/vA5-SqOywQE?si=gNFFJXCluOyk-_ps
+* English: soon
+
 # NMR/Metabolomics Data Processing Toolkit
 
 This repository contains a comprehensive Python toolkit for processing, analyzing, and visualizing NMR and metabolomics data. It was developed to streamline data workflows in metabolomics research by providing a collection of functions for:
